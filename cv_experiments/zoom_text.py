@@ -19,8 +19,14 @@ class Overlay:
 
 class TextOverlay(Overlay):
     """Static. Renders once, returns same frame every call."""
-    def __init__(self, content, color='white', fontsize=80, font='Arial-Bold'):
-        txt = TextClip(content, fontsize=fontsize, color=color, font=font)
+    def __init__(self, content, color='white', fontsize=80, font='Arial-Bold',
+                 max_width=None, max_height=None):
+        fontsize = self._fit_fontsize(content, fontsize, color, font, max_width, max_height)
+        if max_width:
+            txt = TextClip(content, fontsize=fontsize, color=color, font=font,
+                           size=(max_width, None), method='caption')
+        else:
+            txt = TextClip(content, fontsize=fontsize, color=color, font=font)
         self.img = txt.get_frame(0)
         if txt.mask:
             mask_frame = txt.mask.get_frame(0)
@@ -29,6 +35,26 @@ class TextOverlay(Overlay):
             self.mask = mask_frame
         else:
             self.mask = np.ones(self.img.shape[:2], dtype=np.float32)
+
+    @staticmethod
+    def _fit_fontsize(content, fontsize, color, font, max_width, max_height):
+        """Step down fontsize until text fits within max_width x max_height."""
+        if not max_width and not max_height:
+            return fontsize
+        min_size = 20
+        while fontsize >= min_size:
+            if max_width:
+                txt = TextClip(content, fontsize=fontsize, color=color, font=font,
+                               size=(max_width, None), method='caption')
+            else:
+                txt = TextClip(content, fontsize=fontsize, color=color, font=font)
+            th, tw = txt.get_frame(0).shape[:2]
+            fits_w = tw <= max_width if max_width else True
+            fits_h = th <= max_height if max_height else True
+            if fits_w and fits_h:
+                return fontsize
+            fontsize -= 4
+        return min_size
 
     def get_frame(self, t):
         return self.img, self.mask
@@ -73,6 +99,8 @@ def create_overlay(config):
             color=config.get('color', 'white'),
             fontsize=config.get('fontsize', 80),
             font=config.get('font', 'Arial-Bold'),
+            max_width=config.get('_avail_w'),
+            max_height=config.get('_avail_h'),
         )
     elif overlay_type == 'image':
         return ImageOverlay(path=config['path'])
@@ -188,6 +216,32 @@ def create_zoom_follow_effect(
     # -- A. PREPARE OVERLAY ASSET (Run once) --
     overlay = None
     if overlay_config:
+        # Auto-size text to available space
+        if overlay_config.get('type', 'text') == 'text':
+            median_fw = np.median([d[2] for d in face_data])
+            screen_fw = median_fw * zoom_max
+
+            pos_mode = overlay_config.get('position', 'left')
+            margin = overlay_config.get('margin', 1.8)
+            pad = int(w * 0.03)
+
+            if face_side == "right":
+                face_cx = w * 0.72
+            else:
+                face_cx = w * 0.28
+
+            if pos_mode == 'left':
+                avail_w = int(face_cx - (screen_fw / 2 * margin) - pad)
+            elif pos_mode == 'right':
+                avail_w = int(w - (face_cx + screen_fw / 2 * margin) - pad)
+            else:  # top or bottom
+                avail_w = int(w * 0.5)
+
+            avail_h = int(h * 0.6)
+            avail_w = max(avail_w, 100)
+
+            overlay_config = {**overlay_config, '_avail_w': avail_w, '_avail_h': avail_h}
+
         overlay = create_overlay(overlay_config)
 
     def get_state(t):
@@ -357,25 +411,13 @@ create_zoom_follow_effect(
     output_path=f"output_right_{ts}.mp4",
     zoom_max=1.1,
     t_start=1.0,
-    t_end=6.0,
+    t_end=9.0,
     face_side="right",
     text_config={
-        "content": "Hello this is Sidhant!",
+        "content": "Hello this is for Bansi!",
         "position": "left",
-        "color": "yellow"
-    }
-)
-
-create_zoom_follow_effect(
-    input_path="vid.mp4",
-    output_path=f"output_left_{ts}.mp4",
-    zoom_max=1.1,
-    t_start=1.0,
-    t_end=6.0,
-    face_side="left",
-    text_config={
-        "content": "Hello this is Sidhant!",
-        "position": "right",
-        "color": "yellow"
+        "color": "yellow",
+        "t_start": 7.0,
+        "t_end": 10.0,
     }
 )
