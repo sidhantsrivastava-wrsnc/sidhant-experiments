@@ -10,6 +10,77 @@ from moviepy.editor import VideoFileClip, TextClip
 def lerp(start, end, p):
     return start + (end - start) * p
 
+# --- Overlay Abstraction ---
+
+class Overlay:
+    """Base class. Produces (rgb_array, alpha_mask) per frame."""
+    def get_frame(self, t):
+        raise NotImplementedError
+
+class TextOverlay(Overlay):
+    """Static. Renders once, returns same frame every call."""
+    def __init__(self, content, color='white', fontsize=80, font='Arial-Bold'):
+        txt = TextClip(content, fontsize=fontsize, color=color, font=font)
+        self.img = txt.get_frame(0)
+        if txt.mask:
+            mask_frame = txt.mask.get_frame(0)
+            if mask_frame.max() > 1.0:
+                mask_frame = mask_frame / 255.0
+            self.mask = mask_frame
+        else:
+            self.mask = np.ones(self.img.shape[:2], dtype=np.float32)
+
+    def get_frame(self, t):
+        return self.img, self.mask
+
+class ImageOverlay(Overlay):
+    """Static. Loads a PNG/image with alpha channel."""
+    def __init__(self, path):
+        raw = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if raw.shape[2] == 4:
+            raw = cv2.cvtColor(raw, cv2.COLOR_BGRA2RGBA)
+            self.img = raw[:, :, :3]
+            self.mask = raw[:, :, 3] / 255.0
+        else:
+            self.img = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
+            self.mask = np.ones(raw.shape[:2], dtype=np.float32)
+
+    def get_frame(self, t):
+        return self.img, self.mask
+
+class ClipOverlay(Overlay):
+    """Animated. Samples from a VideoFileClip at time t."""
+    def __init__(self, path):
+        self.clip = VideoFileClip(path, has_mask=True)
+
+    def get_frame(self, t):
+        t_clamped = min(t, self.clip.duration - 0.01)
+        img = self.clip.get_frame(t_clamped)
+        if self.clip.mask:
+            mask = self.clip.mask.get_frame(t_clamped)
+            if mask.max() > 1.0:
+                mask = mask / 255.0
+        else:
+            mask = np.ones(img.shape[:2], dtype=np.float32)
+        return img, mask
+
+def create_overlay(config):
+    """Factory: returns an Overlay from an overlay_config dict."""
+    overlay_type = config.get('type', 'text')
+    if overlay_type == 'text':
+        return TextOverlay(
+            content=config.get('content', 'Text'),
+            color=config.get('color', 'white'),
+            fontsize=config.get('fontsize', 80),
+            font=config.get('font', 'Arial-Bold'),
+        )
+    elif overlay_type == 'image':
+        return ImageOverlay(path=config['path'])
+    elif overlay_type == 'clip':
+        return ClipOverlay(path=config['path'])
+    else:
+        raise ValueError(f"Unknown overlay type: {overlay_type}")
+
 # --- 1. Advanced Face Tracking (Position + Size) ---
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "face_landmarker.task")
 
@@ -101,32 +172,23 @@ def create_zoom_follow_effect(
     t_start=0,
     t_end=5,
     face_side="right",
-    text_config=None
+    overlay_config=None,
+    text_config=None,  # Deprecated alias for overlay_config
 ):
+    # Backward compat: text_config is treated as overlay_config if overlay_config not given
+    if overlay_config is None and text_config is not None:
+        overlay_config = text_config
+
     print("1. Analyzing Face Trajectory...")
     raw_data, fps, (w, h) = get_face_data(input_path)
     face_data = smooth_data(raw_data, alpha=0.05)
 
     clip = VideoFileClip(input_path)
 
-    # -- A. PREPARE TEXT ASSET (Run once) --
-    text_img = None
-    text_mask = None
-    if text_config:
-        content = text_config.get('content', "Text")
-        # Ensure fontsize is large enough to be crisp
-        txt = TextClip(content, fontsize=80, color=text_config.get('color', 'white'), font='Arial-Bold')
-        text_img = txt.get_frame(0)
-
-        # Handle Mask: Ensure it is 0-1 Float
-        if txt.mask:
-            mask_frame = txt.mask.get_frame(0)
-            # Normalize if it's 0-255
-            if mask_frame.max() > 1.0:
-                mask_frame = mask_frame / 255.0
-            text_mask = mask_frame
-        else:
-            text_mask = np.ones(text_img.shape[:2], dtype=np.float32)
+    # -- A. PREPARE OVERLAY ASSET (Run once) --
+    overlay = None
+    if overlay_config:
+        overlay = create_overlay(overlay_config)
 
     def get_state(t):
         idx = int(t * fps)
@@ -134,20 +196,22 @@ def create_zoom_follow_effect(
         return face_data[idx]
 
     # -- B. THE OVERLAY FUNCTION (Applied AFTER warp) --
-    def overlay_text_on_warped_frame(bg_frame, fx, fy, fw, fh, opacity):
+    def composite_overlay(bg_frame, overlay_img, overlay_mask, fx, fy, fw, fh, opacity):
         """
-        Composites text onto the already-zoomed frame.
+        Composites an overlay onto the already-zoomed frame.
+        overlay_img: RGB array of the overlay asset
+        overlay_mask: Alpha mask (0-1 float) of the overlay asset
         fx, fy: Coordinates of the face in SCREEN SPACE (not video space)
         """
-        if text_img is None or opacity <= 0:
+        if overlay_img is None or opacity <= 0:
             return bg_frame
 
-        th, tw = text_img.shape[:2]
+        th, tw = overlay_img.shape[:2]
         bh, bw = bg_frame.shape[:2]
 
         # 1. Determine Position relative to the zoomed face
-        pos_mode = text_config.get('position', 'left')
-        margin = text_config.get('margin', 1.3)
+        pos_mode = overlay_config.get('position', 'left')
+        margin = overlay_config.get('margin', 1.8)
 
         # Center of face (fx, fy) is already the correct screen coordinate
         if pos_mode == 'left':
@@ -163,7 +227,7 @@ def create_zoom_follow_effect(
             tx = int(fx - tw // 2)
             ty = int(fy + (fh / 2 * margin))
 
-        # 2. Smart Boundary Checks (Prevent crashing if text goes off-screen)
+        # 2. Smart Boundary Checks (Prevent crashing if overlay goes off-screen)
         x1, y1 = max(0, tx), max(0, ty)
         x2, y2 = min(bw, tx + tw), min(bh, ty + th)
 
@@ -178,22 +242,17 @@ def create_zoom_follow_effect(
         sy2 = sy1 + (y2 - y1)
 
         # 4. Blend
-        # Extract the background region
         roi = bg_frame[y1:y2, x1:x2].astype(np.float32)
+        ovl_roi = overlay_img[sy1:sy2, sx1:sx2].astype(np.float32)
 
-        # Extract the text region
-        txt_roi = text_img[sy1:sy2, sx1:sx2].astype(np.float32)
-
-        # Extract and scale the alpha mask
-        alpha = text_mask[sy1:sy2, sx1:sx2]
+        alpha = overlay_mask[sy1:sy2, sx1:sx2]
         if alpha.ndim == 2:
             alpha = alpha[:, :, np.newaxis]  # Make it (H,W,1)
 
         weighted_alpha = alpha * opacity
 
-        # Composite: Text * Alpha + Background * (1 - Alpha)
         result = bg_frame.copy()
-        result[y1:y2, x1:x2] = (txt_roi * weighted_alpha + roi * (1.0 - weighted_alpha)).astype(np.uint8)
+        result[y1:y2, x1:x2] = (ovl_roi * weighted_alpha + roi * (1.0 - weighted_alpha)).astype(np.uint8)
 
         return result
 
@@ -267,20 +326,21 @@ def create_zoom_follow_effect(
         final_bg = (warped_frame.astype(np.float32) * fade_alpha +
                     fade_bg * (1 - fade_alpha)).astype(np.uint8)
 
-        # --- STEP 5: DRAW TEXT (LAST STEP) ---
-        # Now we draw the UNWARPED text onto the WARPED background
-        if text_config:
-            txt_start = text_config.get('t_start', t_start)
-            txt_end = text_config.get('t_end', t_end)
+        # --- STEP 5: DRAW OVERLAY (LAST STEP) ---
+        # Now we draw the UNWARPED overlay onto the WARPED background
+        if overlay and overlay_config:
+            ovl_start = overlay_config.get('t_start', t_start)
+            ovl_end = overlay_config.get('t_end', t_end)
 
-            if txt_start <= t <= txt_end:
-                txt_p = (t - txt_start) / (txt_end - txt_start) if txt_end > txt_start else 1
-                text_opacity = min(txt_p * 4, 1.0)
+            if ovl_start <= t <= ovl_end:
+                ovl_p = (t - ovl_start) / (ovl_end - ovl_start) if ovl_end > ovl_start else 1
+                ovl_opacity = min(ovl_p * 4, 1.0)
 
-                final_bg = overlay_text_on_warped_frame(
-                    final_bg,
+                ovl_img, ovl_mask = overlay.get_frame(t)
+                final_bg = composite_overlay(
+                    final_bg, ovl_img, ovl_mask,
                     screen_fx, screen_fy, screen_fw, screen_fh,
-                    text_opacity
+                    ovl_opacity
                 )
 
         return final_bg
