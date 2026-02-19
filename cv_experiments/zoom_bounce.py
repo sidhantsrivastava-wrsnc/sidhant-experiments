@@ -1072,16 +1072,34 @@ def _probe_source_codec(video_path):
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
-def _extract_passthrough(input_path, output_path, t_start, t_end, enc):
-    """Extract a passthrough segment via stream copy (near-instant).
+def _probe_keyframe_times(video_path):
+    """Return sorted list of keyframe timestamps (seconds) in the video."""
+    r = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-skip_frame", "nokey",
+            "-show_entries", "frame=pts_time",
+            "-of", "csv=p=0",
+            video_path,
+        ],
+        capture_output=True, text=True,
+    )
+    times = []
+    for line in r.stdout.strip().split("\n"):
+        line = line.strip()
+        if line:
+            try:
+                times.append(float(line))
+            except ValueError:
+                pass
+    return sorted(times)
 
-    Uses -avoid_negative_ts make_zero so the concat demuxer sees clean
-    timestamps even when the cut doesn't land on a keyframe.
-    """
+
+def _extract_passthrough(input_path, output_path, t_start, t_end, enc):
+    """Stream-copy passthrough segment (keyframe-aligned boundaries)."""
     cmd = [
         "ffmpeg", "-y", "-ss", str(t_start), "-to", str(t_end),
         "-i", input_path, "-c:v", "copy", "-an",
-        "-avoid_negative_ts", "make_zero",
         output_path,
     ]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
@@ -1437,18 +1455,65 @@ def _run_segment_pipeline(
     stabilize, debug_labels, w, h, enc,
 ):
     """Orchestrate segment-based rendering: stream-copy passthrough, render active, concat."""
+    import bisect
     tmp_dir = tempfile.mkdtemp(prefix="zb_seg_")
     segments = []  # (path, type, frame_start, frame_end)
     seg_idx = 0
     min_hold_frames = int(fps)  # 1 second minimum for FFmpeg hold
 
+    # Probe source keyframes so passthrough can stream-copy between them.
+    # Active segments absorb any non-keyframe-aligned frames at boundaries.
+    kf_times = _probe_keyframe_times(input_path)
+    kf_frames = sorted(set(int(round(t * fps)) for t in kf_times)) if kf_times else []
+
+    def _snap_forward(frame):
+        """First keyframe at or after frame."""
+        i = bisect.bisect_left(kf_frames, frame)
+        return kf_frames[i] if i < len(kf_frames) else None
+
+    def _snap_backward(frame):
+        """Last keyframe at or before frame."""
+        i = bisect.bisect_right(kf_frames, frame) - 1
+        return kf_frames[i] if i >= 0 else None
+
     prev_end = 0
     for rng_start, rng_end in render_ranges:
-        # Passthrough before this range
+        # Passthrough before this range — snap inward to keyframe boundaries
         if rng_start > prev_end:
-            seg_path = os.path.join(tmp_dir, f"seg_{seg_idx:04d}_pass.mp4")
-            segments.append((seg_path, "passthrough", prev_end, rng_start - 1))
-            seg_idx += 1
+            pass_start = prev_end
+            pass_end = rng_start - 1
+            if kf_frames:
+                # Snap start forward to first keyframe at or after pass_start
+                snapped_start = _snap_forward(pass_start)
+                # Snap end backward to last keyframe before pass_end (exclusive)
+                # so the segment ends just before the next keyframe
+                snapped_end_kf = _snap_backward(pass_end)
+                if (snapped_start is not None and snapped_end_kf is not None
+                        and snapped_start < snapped_end_kf):
+                    # Re-encode the small prefix before first keyframe
+                    if snapped_start > pass_start:
+                        seg_path = os.path.join(tmp_dir, f"seg_{seg_idx:04d}_active.mp4")
+                        segments.append((seg_path, "active", pass_start, snapped_start - 1))
+                        seg_idx += 1
+                    # Stream-copy the keyframe-aligned middle
+                    seg_path = os.path.join(tmp_dir, f"seg_{seg_idx:04d}_pass.mp4")
+                    segments.append((seg_path, "passthrough", snapped_start, snapped_end_kf - 1))
+                    seg_idx += 1
+                    # Re-encode the small suffix after last keyframe
+                    if snapped_end_kf <= pass_end:
+                        seg_path = os.path.join(tmp_dir, f"seg_{seg_idx:04d}_active.mp4")
+                        segments.append((seg_path, "active", snapped_end_kf, pass_end))
+                        seg_idx += 1
+                else:
+                    # Too short to fit keyframes — re-encode the whole thing
+                    seg_path = os.path.join(tmp_dir, f"seg_{seg_idx:04d}_active.mp4")
+                    segments.append((seg_path, "active", pass_start, pass_end))
+                    seg_idx += 1
+            else:
+                # No keyframe info — fall back to re-encode
+                seg_path = os.path.join(tmp_dir, f"seg_{seg_idx:04d}_active.mp4")
+                segments.append((seg_path, "active", pass_start, pass_end))
+                seg_idx += 1
 
         # Split active range: find hold sub-region (p≈1, no effects, constant z)
         seg_p = p_curve[rng_start:rng_end + 1]
@@ -1490,10 +1555,31 @@ def _run_segment_pipeline(
 
     # Trailing passthrough
     if prev_end < n_frames:
-        seg_path = os.path.join(tmp_dir, f"seg_{seg_idx:04d}_pass.mp4")
-        segments.append((seg_path, "passthrough", prev_end, n_frames - 1))
+        pass_start = prev_end
+        pass_end = n_frames - 1
+        if kf_frames:
+            snapped_start = _snap_forward(pass_start)
+            if snapped_start is not None and snapped_start <= pass_end:
+                if snapped_start > pass_start:
+                    seg_path = os.path.join(tmp_dir, f"seg_{seg_idx:04d}_active.mp4")
+                    segments.append((seg_path, "active", pass_start, snapped_start - 1))
+                    seg_idx += 1
+                seg_path = os.path.join(tmp_dir, f"seg_{seg_idx:04d}_pass.mp4")
+                segments.append((seg_path, "passthrough", snapped_start, pass_end))
+                seg_idx += 1
+            else:
+                seg_path = os.path.join(tmp_dir, f"seg_{seg_idx:04d}_active.mp4")
+                segments.append((seg_path, "active", pass_start, pass_end))
+                seg_idx += 1
+        else:
+            seg_path = os.path.join(tmp_dir, f"seg_{seg_idx:04d}_pass.mp4")
+            segments.append((seg_path, "passthrough", pass_start, pass_end))
+            seg_idx += 1
 
-    print(f"   Segment pipeline: {len(segments)} segments ({sum(1 for _, t, *_ in segments if t == 'active')} active, {sum(1 for _, t, *_ in segments if t == 'passthrough')} passthrough)")
+    n_pass = sum(1 for _, t, *_ in segments if t == "passthrough")
+    n_active = sum(1 for _, t, *_ in segments if t == "active")
+    pass_frames = sum(fe - fs + 1 for _, t, fs, fe in segments if t == "passthrough")
+    print(f"   Segment pipeline: {len(segments)} segments ({n_active} active, {n_pass} passthrough [{pass_frames} frames stream-copy])")
 
     t0 = time.monotonic()
 
