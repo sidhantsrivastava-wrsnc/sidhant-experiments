@@ -15,43 +15,1003 @@ When PyNvVideoCodec is unavailable:
     with pre-allocated buffer pool and GPU whip kernel)
 """
 
+import bisect
 import os
 import queue
+import re
 import shutil
 import subprocess
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import cv2
-cv2.setNumThreads(1)
-import numpy as np
 import cupy as cp
+import mediapipe as mp
+import numpy as np
+from mediapipe.tasks.python import BaseOptions, vision
+from moviepy.editor import TextClip, VideoFileClip
 
-from zoom_bounce import (
-    # Constants
-    EDGE_STRIP_FRAC, FADE_WIDTH_FRAC,
-    # Curve builders
-    build_bounce_curves, build_effect_curves,
-    # Face detection
-    get_face_data, get_face_data_seek, smooth_data,
-    # Segment management
-    _compute_active_frame_ranges, _compute_render_ranges,
-    _probe_source_codec, _probe_keyframe_times,
-    _extract_passthrough, _render_hold_ffmpeg,
-    _concat_segments,
-    # FFmpeg
-    open_ffmpeg_writer, mux_audio, detect_best_encoder,
-    # Overlay
-    create_overlay,
-    # Easing
-    EASE_FUNCTIONS,
-    # Misc
-    lerp,
-)
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "face_landmarker.task")
 
-# ─── Optional PyNvVideoCodec import ─────────────────────────────────────────
+EDGE_STRIP_FRAC = 0.04
+FADE_WIDTH_FRAC = 0.25
+
+
+def lerp(a, b, t):
+    return a + (b - a) * t
+
+
+# ─── Bounce easing functions ────────────────────────────────────────────────
+
+
+def ease_smooth(t):
+    """sin(pi*t) — clean symmetric punch in then out."""
+    return np.sin(np.pi * t)
+
+
+def ease_snap(t):
+    """Fast attack, brief hold at peak, fast release — editorial punch."""
+    out = np.zeros_like(t, dtype=np.float32)
+    attack = t < 0.25
+    hold = (t >= 0.25) & (t <= 0.75)
+    release = t > 0.75
+    out[attack] = (t[attack] / 0.25) ** 2
+    out[hold] = 1.0
+    r = (t[release] - 0.75) / 0.25
+    out[release] = 1.0 - r**2
+    return out
+
+
+def ease_overshoot(t):
+    """Elastic — overshoots ~15%, springs back, then releases. Playful energy."""
+    base = np.sin(np.pi * t)
+    overshoot = 0.15 * np.sin(2.0 * np.pi * t)
+    return np.clip(base + overshoot, 0.0, 1.15)
+
+
+EASE_FUNCTIONS = {
+    "smooth": ease_smooth,
+    "snap": ease_snap,
+    "overshoot": ease_overshoot,
+}
+
+
+def ease_in_smooth(t):
+    return np.sin(np.pi / 2 * t)
+
+
+def ease_in_snap(t):
+    out = np.zeros_like(t, dtype=np.float32)
+    fast = t < 0.5
+    out[fast] = (t[fast] / 0.5) ** 2
+    out[~fast] = 1.0
+    return out
+
+
+def ease_in_overshoot(t):
+    base = np.sin(np.pi / 2 * t)
+    overshoot = 0.15 * np.sin(np.pi * t)
+    return np.clip(base + overshoot, 0.0, 1.15)
+
+
+EASE_IN_FUNCTIONS = {
+    "smooth": ease_in_smooth,
+    "snap": ease_in_snap,
+    "overshoot": ease_in_overshoot,
+}
+
+
+def ease_out_smooth(t):
+    return np.cos(np.pi / 2 * t)
+
+
+def ease_out_snap(t):
+    return np.clip(1.0 - t**2, 0.0, 1.0)
+
+
+def ease_out_overshoot(t):
+    base = np.cos(np.pi / 2 * t)
+    undershoot = -0.15 * np.sin(np.pi * t)
+    return np.clip(base + undershoot, 0.0, 1.15)
+
+
+EASE_OUT_FUNCTIONS = {
+    "smooth": ease_out_smooth,
+    "snap": ease_out_snap,
+    "overshoot": ease_out_overshoot,
+}
+
+
+# ─── Event parsing ───────────────────────────────────────────────────────────
+
+
+def _parse_events(bounces, default_mode, default_zoom):
+    """
+    Normalize bounce entries (tuples and dicts) into canonical event list.
+
+    Returns list of dicts: {"action", "start", "end", "ease", "zoom"}
+    Validates: no double zoom-in, no zoom-out without prior zoom-in.
+    """
+    events = []
+    for b in bounces:
+        if isinstance(b, dict):
+            ev = {**b}
+            ev.setdefault("ease", default_mode)
+            ev.setdefault("zoom", default_zoom)
+            events.append(ev)
+        else:
+            if len(b) == 2:
+                ev = {
+                    "action": "bounce",
+                    "start": b[0],
+                    "end": b[1],
+                    "ease": default_mode,
+                    "zoom": default_zoom,
+                }
+            elif len(b) == 3:
+                ev = {
+                    "action": "bounce",
+                    "start": b[0],
+                    "end": b[1],
+                    "ease": b[2],
+                    "zoom": default_zoom,
+                }
+            else:
+                ev = {
+                    "action": "bounce",
+                    "start": b[0],
+                    "end": b[1],
+                    "ease": b[2],
+                    "zoom": b[3],
+                }
+            events.append(ev)
+
+    zoomed_in = False
+    last_zoom = default_zoom
+    for ev in events:
+        action = ev["action"]
+        if action == "in":
+            if zoomed_in:
+                raise ValueError(
+                    f"Double zoom-in at t={ev['start']}: already zoomed in"
+                )
+            zoomed_in = True
+            last_zoom = ev["zoom"]
+        elif action == "out":
+            if not zoomed_in:
+                raise ValueError(f"Zoom-out at t={ev['start']} without prior zoom-in")
+            zoomed_in = False
+            ev["zoom"] = last_zoom
+
+    return events
+
+
+# ─── Curve builders ──────────────────────────────────────────────────────────
+
+
+def build_bounce_curves(n_frames, fps, bounces, default_mode, default_zoom):
+    """
+    Build per-frame p (intensity 0-1) and zoom arrays.
+
+    Returns: (times, p_curve, zooms) — all shape (n_frames,) float32
+    """
+    times = np.arange(n_frames, dtype=np.float32) / fps
+    p_curve = np.zeros(n_frames, dtype=np.float32)
+    zooms = np.ones(n_frames, dtype=np.float32)
+
+    events = _parse_events(bounces, default_mode, default_zoom)
+
+    for ev in events:
+        action = ev["action"]
+        bs, be = ev["start"], ev["end"]
+        mode = ev["ease"]
+        zm = ev["zoom"]
+        dur = max(be - bs, 1e-9)
+        mask = (times >= bs) & (times <= be)
+
+        if action == "bounce":
+            ease_fn = EASE_FUNCTIONS[mode]
+            t_norm = np.clip((times[mask] - bs) / dur, 0.0, 1.0)
+            p_vals = ease_fn(t_norm)
+            new_zooms = 1.0 + (zm - 1.0) * p_vals
+            better = new_zooms > zooms[mask]
+            p_curve[mask] = np.where(better, p_vals, p_curve[mask])
+            zooms[mask] = np.where(better, new_zooms, zooms[mask])
+
+        elif action == "in":
+            ease_fn = EASE_IN_FUNCTIONS[mode]
+            t_norm = np.clip((times[mask] - bs) / dur, 0.0, 1.0)
+            p_vals = ease_fn(t_norm)
+            p_curve[mask] = np.maximum(p_curve[mask], p_vals)
+            zooms[mask] = np.maximum(zooms[mask], 1.0 + (zm - 1.0) * p_vals)
+
+        elif action == "out":
+            ease_fn = EASE_OUT_FUNCTIONS[mode]
+            t_norm = np.clip((times[mask] - bs) / dur, 0.0, 1.0)
+            p_vals = ease_fn(t_norm)
+            p_curve[mask] = np.maximum(p_curve[mask], p_vals)
+            zooms[mask] = np.maximum(zooms[mask], 1.0 + (zm - 1.0) * p_vals)
+
+    zoomed_in = False
+    in_end = 0.0
+    in_zoom = default_zoom
+    for ev in events:
+        if ev["action"] == "in":
+            zoomed_in = True
+            in_end = ev["end"]
+            in_zoom = ev["zoom"]
+        elif ev["action"] == "out" and zoomed_in:
+            out_start = ev["start"]
+            hold_mask = (times > in_end) & (times < out_start)
+            p_curve[hold_mask] = 1.0
+            zooms[hold_mask] = in_zoom
+            zoomed_in = False
+
+    return times, p_curve, zooms
+
+
+def build_effect_curves(n_frames, fps, bounces, default_mode, default_zoom):
+    """
+    Build per-frame intensity arrays for zoom_blur and whip effects.
+
+    Returns: (blur_strength, blur_n_samples, whip_strength, whip_direction)
+    """
+    times = np.arange(n_frames, dtype=np.float32) / fps
+    blur_strength = np.zeros(n_frames, dtype=np.float32)
+    blur_n_samples = np.zeros(n_frames, dtype=np.int32)
+    whip_strength = np.zeros(n_frames, dtype=np.float32)
+    whip_direction = ["h"] * n_frames
+
+    events = _parse_events(bounces, default_mode, default_zoom)
+
+    for ev in events:
+        action = ev["action"]
+        if action not in ("zoom_blur", "whip"):
+            continue
+
+        bs, be = ev["start"], ev["end"]
+        dur = max(be - bs, 1e-9)
+        intensity = ev.get("intensity", 1.0)
+        mask = (times >= bs) & (times <= be)
+        t_norm = np.clip((times[mask] - bs) / dur, 0.0, 1.0)
+        strength = np.sin(np.pi * t_norm).astype(np.float32) * intensity
+
+        if action == "zoom_blur":
+            n_samp = ev.get("n_samples", 8)
+            blur_strength[mask] = np.maximum(blur_strength[mask], strength)
+            blur_n_samples[mask] = np.where(
+                strength > blur_strength[mask] - 1e-6, n_samp, blur_n_samples[mask]
+            )
+        elif action == "whip":
+            direction = ev.get("direction", "h")
+            whip_strength[mask] = np.maximum(whip_strength[mask], strength)
+            indices = np.where(mask)[0]
+            for i in indices:
+                whip_direction[i] = direction
+
+    return blur_strength, blur_n_samples, whip_strength, whip_direction
+
+
+# ─── Encoder detection ───────────────────────────────────────────────────────
+
+
+def _probe_encoder(name):
+    try:
+        r = subprocess.run(
+            [
+                "ffmpeg", "-y", "-f", "lavfi",
+                "-i", "color=black:s=256x256:d=0.04",
+                "-c:v", name, "-f", "null", "-",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+_ENCODER_CANDIDATES = {
+    "h264": ["h264_nvenc", "h264_videotoolbox", "h264_qsv", "libx264"],
+    "hevc": ["hevc_nvenc", "hevc_videotoolbox", "hevc_qsv", "libx265"],
+    "av1": ["av1_nvenc", "av1_videotoolbox", "av1_qsv", "libsvtav1", "libaom-av1"],
+    "vp9": ["libvpx-vp9"],
+}
+
+_encoder_cache = {}
+
+
+def detect_best_encoder(codec="h264"):
+    if codec not in _encoder_cache:
+        candidates = _ENCODER_CANDIDATES.get(codec, [f"lib{codec}"])
+        with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
+            results = list(pool.map(_probe_encoder, candidates))
+        best = None
+        for e, ok in zip(candidates, results):
+            if ok:
+                best = e
+                break
+        _encoder_cache[codec] = best or (candidates[-1] if candidates else f"lib{codec}")
+        print(f"   Encoder ({codec}): {_encoder_cache[codec]}")
+    return _encoder_cache[codec]
+
+
+# ─── FFmpeg utilities ─────────────────────────────────────────────────────────
+
+
+def open_ffmpeg_writer(path, w, h, fps, enc, pix_fmt="rgb24"):
+    cmd = [
+        "ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", pix_fmt,
+        "-s", f"{w}x{h}", "-r", str(fps), "-i", "pipe:0", "-c:v", enc,
+    ]
+    if pix_fmt != "nv12":
+        cmd += ["-pix_fmt", "yuv420p"]
+    cmd += ["-movflags", "+faststart"]
+    if enc == "libx264":
+        cmd += ["-preset", "fast", "-crf", "18"]
+    elif enc == "h264_nvenc":
+        cmd += ["-preset", "p4", "-rc", "vbr", "-cq", "20"]
+    elif enc == "h264_videotoolbox":
+        cmd += ["-q:v", "65"]
+    elif enc == "libx265":
+        cmd += ["-preset", "fast", "-crf", "22"]
+    elif enc == "hevc_videotoolbox":
+        cmd += ["-q:v", "65"]
+    elif enc == "hevc_nvenc":
+        cmd += ["-preset", "p4", "-rc", "vbr", "-cq", "22"]
+    elif enc == "libsvtav1":
+        cmd += ["-preset", "6", "-crf", "28"]
+    elif enc == "libaom-av1":
+        cmd += ["-cpu-used", "6", "-crf", "28"]
+    elif enc == "av1_videotoolbox":
+        cmd += ["-q:v", "65"]
+    elif enc == "av1_nvenc":
+        cmd += ["-preset", "p4", "-rc", "vbr", "-cq", "28"]
+    cmd.append(path)
+    return subprocess.Popen(
+        cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+
+def _run_ffmpeg_with_progress(cmd, total_frames, fps):
+    """Run an FFmpeg command, printing frame progress for long encodes."""
+    if total_frames < fps * 10:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+        return
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+    )
+    last_print = 0
+    frame_re = re.compile(r"frame=\s*(\d+)")
+    buf = ""
+    for chunk in iter(lambda: proc.stderr.read(256), ""):
+        buf += chunk
+        lines = buf.split("\r")
+        buf = lines[-1]
+        for line in lines[:-1]:
+            m = frame_re.search(line)
+            if m:
+                done = int(m.group(1))
+                if done - last_print >= 500:
+                    print(f"       encode {done}/{total_frames}", flush=True)
+                    last_print = done
+    proc.wait()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
+
+
+def _extract_passthrough(input_path, output_path, t_start, t_end, enc,
+                         reencode=False):
+    """Extract passthrough segment. Stream-copy when possible, re-encode when
+    source codec differs from output codec."""
+    if reencode:
+        cmd = [
+            "ffmpeg", "-y", "-ss", str(t_start), "-to", str(t_end),
+            "-i", input_path, "-c:v", enc, "-an",
+        ]
+        if enc == "h264_nvenc":
+            cmd += ["-preset", "p4", "-rc", "vbr", "-cq", "20"]
+        elif enc == "h264_videotoolbox":
+            cmd += ["-q:v", "65"]
+        elif enc == "hevc_nvenc":
+            cmd += ["-preset", "p4", "-rc", "vbr", "-cq", "22"]
+        else:
+            cmd += ["-preset", "fast", "-crf", "18"]
+        cmd.append(output_path)
+    else:
+        cmd = [
+            "ffmpeg", "-y", "-ss", str(t_start), "-to", str(t_end),
+            "-i", input_path, "-c:v", "copy", "-an",
+            output_path,
+        ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+
+
+def _render_hold_ffmpeg(input_path, output_path, frame_start, frame_end,
+                        face_data_stable, z, face_side, dest_x_full,
+                        fps, w, h, enc):
+    """
+    Render a hold region (constant zoom, slowly drifting face) entirely via
+    FFmpeg crop+scale — no Python frame loop.
+    """
+    KEY_INTERVAL = 5
+
+    crop_w = int(w / z)
+    crop_h = int(h / z)
+    n = frame_end - frame_start + 1
+
+    cx_arr = []
+    cy_arr = []
+    for k in range(n):
+        abs_idx = frame_start + k
+        fx_st = float(face_data_stable[abs_idx][0])
+        fy_st = float(face_data_stable[abs_idx][1])
+        cx = fx_st - dest_x_full / z
+        cy = fy_st - (h / 2) / z
+        cx = max(0, min(cx, w - crop_w))
+        cy = max(0, min(cy, h - crop_h))
+        cx_arr.append(cx)
+        cy_arr.append(cy)
+
+    cx_min, cx_max = min(cx_arr), max(cx_arr)
+    cy_min, cy_max = min(cy_arr), max(cy_arr)
+    drift = max(cx_max - cx_min, cy_max - cy_min)
+
+    t_start = frame_start / fps
+    t_end = (frame_end + 1) / fps
+
+    if drift < 0.02 * w:
+        avg_cx = int(sum(cx_arr) / n)
+        avg_cy = int(sum(cy_arr) / n)
+        avg_cx = max(0, min(avg_cx, w - crop_w))
+        avg_cy = max(0, min(avg_cy, h - crop_h))
+        vf = f"crop={crop_w}:{crop_h}:{avg_cx}:{avg_cy},scale={w}:{h}:flags=bilinear"
+    else:
+        key_interval_frames = int(KEY_INTERVAL * fps)
+        keyframe_indices = list(range(0, n, key_interval_frames))
+        if keyframe_indices[-1] != n - 1:
+            keyframe_indices.append(n - 1)
+
+        def _avg_at(idx, arr):
+            half_win = int(fps)
+            lo = max(0, idx - half_win)
+            hi = min(n, idx + half_win + 1)
+            return sum(arr[lo:hi]) / (hi - lo)
+
+        kf_cx = [_avg_at(i, cx_arr) for i in keyframe_indices]
+        kf_cy = [_avg_at(i, cy_arr) for i in keyframe_indices]
+        kf_t = [i / fps for i in keyframe_indices]
+
+        for i in range(len(kf_cx)):
+            kf_cx[i] = max(0, min(kf_cx[i], w - crop_w))
+            kf_cy[i] = max(0, min(kf_cy[i], h - crop_h))
+
+        def _build_lerp_expr(kf_vals, kf_times):
+            if len(kf_vals) == 1:
+                return str(int(kf_vals[0]))
+            expr = str(int(kf_vals[-1]))
+            for i in range(len(kf_vals) - 2, -1, -1):
+                t0 = kf_times[i]
+                t1 = kf_times[i + 1]
+                v0 = kf_vals[i]
+                v1 = kf_vals[i + 1]
+                seg_dur = t1 - t0
+                if seg_dur <= 0:
+                    continue
+                seg_expr = f"lerp({int(v0)}\\,{int(v1)}\\,(t-{t0:.3f})/{seg_dur:.3f})"
+                expr = f"if(between(t\\,{t0:.3f}\\,{t1:.3f})\\,{seg_expr}\\,{expr})"
+            return expr
+
+        cx_expr = _build_lerp_expr(kf_cx, kf_t)
+        cy_expr = _build_lerp_expr(kf_cy, kf_t)
+        vf = f"crop={crop_w}:{crop_h}:'{cx_expr}':'{cy_expr}',scale={w}:{h}:flags=bilinear"
+
+    cmd = [
+        "ffmpeg", "-y", "-ss", str(t_start), "-to", str(t_end),
+        "-i", input_path, "-vf", vf, "-c:v", enc, "-pix_fmt", "yuv420p",
+        "-an", output_path,
+    ]
+    if "libx264" in enc:
+        cmd[-2:-2] = ["-preset", "ultrafast", "-crf", "18"]
+    elif "libsvtav1" in enc:
+        cmd[-2:-2] = ["-preset", "12", "-crf", "28"]
+    elif "videotoolbox" in enc:
+        cmd[-2:-2] = ["-q:v", "65"]
+    elif "nvenc" in enc:
+        cmd[-2:-2] = ["-preset", "p4", "-rc", "vbr", "-cq", "22"]
+    _run_ffmpeg_with_progress(cmd, n, fps)
+
+
+def _concat_segments(segment_paths, output_path):
+    """Concatenate segments via FFmpeg concat demuxer (stream copy)."""
+    tmp_dir = os.path.dirname(segment_paths[0])
+    filelist = os.path.join(tmp_dir, "filelist.txt")
+    with open(filelist, "w") as f:
+        for p in segment_paths:
+            f.write(f"file '{p}'\n")
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", filelist, "-c", "copy", output_path,
+        ],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True,
+    )
+
+
+def _probe_source_codec(video_path):
+    """Return the video codec name of the source file (e.g. 'h264')."""
+    r = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=codec_name", "-of", "csv=p=0",
+            video_path,
+        ],
+        capture_output=True, text=True,
+    )
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def _probe_keyframe_times(video_path):
+    """Return sorted list of keyframe timestamps (seconds) in the video."""
+    r = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-skip_frame", "nokey",
+            "-show_entries", "frame=pts_time",
+            "-of", "csv=p=0",
+            video_path,
+        ],
+        capture_output=True, text=True,
+    )
+    times = []
+    for line in r.stdout.strip().split("\n"):
+        line = line.strip()
+        if line:
+            try:
+                times.append(float(line))
+            except ValueError:
+                pass
+    return sorted(times)
+
+
+def mux_audio(src, silent, out):
+    probe = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "a",
+            "-show_entries", "stream=index", "-of", "csv=p=0", src,
+        ],
+        capture_output=True, text=True,
+    )
+    has_audio = probe.returncode == 0 and probe.stdout.strip() != ""
+
+    if has_audio:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", silent, "-i", src,
+                "-c:v", "copy", "-c:a", "aac",
+                "-map", "0:v:0", "-map", "1:a:0", "-shortest", out,
+            ],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            return
+        print(f"   Warning: Mux with audio failed (exit {result.returncode}):")
+        print(f"     {result.stderr[-300:]}")
+        print(f"     Falling back to video-only ...")
+
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", silent, "-c:v", "copy", out],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    if not has_audio:
+        print("   (source has no audio track — skipped)")
+
+
+# ─── Overlay classes ─────────────────────────────────────────────────────────
+
+
+class Overlay:
+    def get_frame(self, t):
+        raise NotImplementedError
+
+
+class TextOverlay(Overlay):
+    def __init__(self, content, color="white", fontsize=80, font="Arial-Bold",
+                 max_width=None, max_height=None):
+        fontsize = self._fit(content, fontsize, color, font, max_width, max_height)
+        kw = dict(fontsize=fontsize, color=color, font=font)
+        if max_width:
+            kw.update(size=(max_width, None), method="caption")
+        txt = TextClip(content, **kw)
+        self.img = np.ascontiguousarray(txt.get_frame(0), dtype=np.float32)
+        if txt.mask:
+            m = txt.mask.get_frame(0)
+            if m.max() > 1.0:
+                m = m / 255.0
+            self.mask = np.ascontiguousarray(m[:, :, np.newaxis], dtype=np.float32)
+        else:
+            self.mask = np.ones((*self.img.shape[:2], 1), dtype=np.float32)
+
+    @staticmethod
+    def _fit(content, fs, color, font, mw, mh):
+        if not mw and not mh:
+            return fs
+        for s in range(fs, 19, -4):
+            kw = dict(fontsize=s, color=color, font=font)
+            if mw:
+                kw.update(size=(mw, None), method="caption")
+            sh = TextClip(content, **kw).get_frame(0).shape[:2]
+            if (not mw or sh[1] <= mw) and (not mh or sh[0] <= mh):
+                return s
+        return 20
+
+    def get_frame(self, t):
+        return self.img, self.mask
+
+
+class ImageOverlay(Overlay):
+    def __init__(self, path):
+        raw = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if raw.shape[2] == 4:
+            raw = cv2.cvtColor(raw, cv2.COLOR_BGRA2RGBA)
+            self.img = np.ascontiguousarray(raw[:, :, :3], dtype=np.float32)
+            self.mask = np.ascontiguousarray(raw[:, :, 3:4] / 255.0, dtype=np.float32)
+        else:
+            self.img = np.ascontiguousarray(
+                cv2.cvtColor(raw, cv2.COLOR_BGR2RGB), dtype=np.float32
+            )
+            self.mask = np.ones((*raw.shape[:2], 1), dtype=np.float32)
+
+    def get_frame(self, t):
+        return self.img, self.mask
+
+
+class ClipOverlay(Overlay):
+    def __init__(self, path):
+        self.clip = VideoFileClip(path, has_mask=True)
+
+    def get_frame(self, t):
+        t = min(t, self.clip.duration - 0.01)
+        img = np.ascontiguousarray(self.clip.get_frame(t), dtype=np.float32)
+        if self.clip.mask:
+            m = self.clip.mask.get_frame(t)
+            if m.max() > 1.0:
+                m = m / 255.0
+            mask = np.ascontiguousarray(m[:, :, np.newaxis], dtype=np.float32)
+        else:
+            mask = np.ones((*img.shape[:2], 1), dtype=np.float32)
+        return img, mask
+
+
+def create_overlay(cfg):
+    t = cfg.get("type", "text")
+    if t == "text":
+        return TextOverlay(
+            cfg.get("content", "Text"),
+            cfg.get("color", "white"),
+            cfg.get("fontsize", 80),
+            cfg.get("font", "Arial-Bold"),
+            cfg.get("_avail_w"),
+            cfg.get("_avail_h"),
+        )
+    if t == "image":
+        return ImageOverlay(cfg["path"])
+    if t == "clip":
+        return ClipOverlay(cfg["path"])
+    raise ValueError(f"Unknown overlay type: {t}")
+
+
+# ─── Face detection ──────────────────────────────────────────────────────────
+
+
+def _frame_in_ranges(idx, ranges):
+    """Check if frame index falls within any sorted range (early exit)."""
+    for s, e in ranges:
+        if idx < s:
+            return False
+        if idx <= e:
+            return True
+    return False
+
+
+def _detect_range_worker(args):
+    """
+    Worker function for parallel face detection.  Each worker opens its own
+    ffmpeg pipe decoder and FaceLandmarker to process a batch of active ranges.
+    """
+    video_path, ranges_batch, stride, worker_id = args
+    import subprocess as _sp
+    import mediapipe as _mp
+    from mediapipe.tasks.python import vision as _vision, BaseOptions as _BO
+
+    _probe = _sp.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height,r_frame_rate",
+         "-of", "csv=p=0", video_path],
+        capture_output=True, text=True,
+    )
+    parts = _probe.stdout.strip().split(",")
+    w, h = int(parts[0]), int(parts[1])
+    fps_str = parts[2]
+    if "/" in fps_str:
+        num, den = fps_str.split("/")
+        fps = float(num) / float(den)
+    else:
+        fps = float(fps_str)
+
+    opts = _vision.FaceLandmarkerOptions(
+        base_options=_BO(model_asset_path=MODEL_PATH),
+        running_mode=_vision.RunningMode.VIDEO,
+        num_faces=1,
+        min_face_detection_confidence=0.5,
+        min_face_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    lm = _vision.FaceLandmarker.create_from_options(opts)
+    default = (w // 2, h // 2, 100, 100)
+    last_detected = default
+    results = []
+    done_infer = 0
+    total_infer = sum((e - s) // stride + 1 for s, e in ranges_batch)
+    frame_size = w * h * 3
+
+    for rng_start, rng_end in ranges_batch:
+        n_frames = rng_end - rng_start + 1
+        t_start = rng_start / fps
+        cmd = [
+            "ffmpeg", "-ss", str(t_start), "-i", video_path,
+            "-frames:v", str(n_frames),
+            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "pipe:1",
+        ]
+        proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.DEVNULL)
+        key_indices = []
+        key_vals = []
+        for idx in range(rng_start, rng_end + 1):
+            data = proc.stdout.read(frame_size)
+            if len(data) != frame_size:
+                break
+            run_detect = (idx - rng_start) % stride == 0 or idx == rng_end
+            if run_detect:
+                rgb = np.frombuffer(data, dtype=np.uint8).reshape(h, w, 3)
+                ts_ms = int(idx * 1000 / fps)
+                res = lm.detect_for_video(
+                    _mp.Image(image_format=_mp.ImageFormat.SRGB, data=rgb),
+                    ts_ms,
+                )
+                if res.face_landmarks:
+                    f = res.face_landmarks[0]
+                    detected = (
+                        int(f[4].x * w),
+                        int(f[4].y * h),
+                        int(abs(f[454].x - f[234].x) * w),
+                        int(abs(f[152].y - f[10].y) * h),
+                    )
+                    last_detected = detected
+                key_indices.append(idx)
+                key_vals.append(last_detected)
+                done_infer += 1
+                if done_infer % 50 == 0:
+                    print(f"   [worker {worker_id}] detect {done_infer}/{total_infer}", flush=True)
+
+        proc.stdout.close()
+        proc.wait()
+
+        if len(key_indices) >= 2:
+            ki = np.array(key_indices, dtype=np.float64)
+            kv = np.array(key_vals, dtype=np.float64)
+            all_idx = np.arange(rng_start, rng_end + 1, dtype=np.float64)
+            interped = np.column_stack([
+                np.interp(all_idx, ki, kv[:, c]) for c in range(4)
+            ]).astype(int)
+            for j, idx in enumerate(range(rng_start, rng_end + 1)):
+                results.append((idx, tuple(interped[j])))
+        elif len(key_indices) == 1:
+            results.append((key_indices[0], key_vals[0]))
+
+        results.append(("last", rng_end, last_detected))
+
+    lm.close()
+    return results, done_infer
+
+
+def _apply_worker_results(data, all_results, active_ranges, n_frames, default):
+    """Merge worker results into the data array and fill gaps between ranges."""
+    last_detected_per_range = {}
+    for results in all_results:
+        for entry in results:
+            if isinstance(entry, tuple) and len(entry) == 3 and entry[0] == "last":
+                _, rng_end, last_det = entry
+                last_detected_per_range[rng_end] = last_det
+            else:
+                idx, val = entry
+                data[idx] = val
+
+    last_detected = default
+    for ri, (rng_start, rng_end) in enumerate(active_ranges):
+        last_detected = last_detected_per_range.get(rng_end, last_detected)
+        next_fill_end = n_frames
+        for ns, _ in active_ranges:
+            if ns > rng_end:
+                next_fill_end = ns
+                break
+        for fill_idx in range(rng_end + 1, next_fill_end):
+            data[fill_idx] = last_detected
+
+
+def get_face_data_seek(video_path, active_ranges, n_frames, stride=3):
+    """
+    Seek-based face detection: only decode + detect frames within active_ranges.
+    Runs inference every `stride` frames and interpolates the rest.
+    """
+    cap = cv2.VideoCapture(video_path)
+    w, h = int(cap.get(3)), int(cap.get(4))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+
+    default = (w // 2, h // 2, 100, 100)
+    data = [default] * n_frames
+    total_read = sum(e - s + 1 for s, e in active_ranges)
+    total_infer = sum((e - s) // stride + 1 for s, e in active_ranges)
+
+    n_workers = max(1, os.cpu_count() // 2)
+
+    if n_workers <= 1:
+        result, done_infer = _detect_range_worker(
+            (video_path, active_ranges, stride, 0)
+        )
+        _apply_worker_results(data, [result], active_ranges, n_frames, default)
+        print(f"   Inference: {done_infer} frames (stride={stride}, {total_read} read)")
+    else:
+        target_per_worker = max(int(fps * 10), total_read // n_workers)
+        split_ranges = []
+        for s, e in active_ranges:
+            rng_len = e - s + 1
+            if rng_len <= target_per_worker:
+                split_ranges.append((s, e))
+            else:
+                cur = s
+                while cur <= e:
+                    chunk_end = min(cur + target_per_worker - 1, e)
+                    split_ranges.append((cur, chunk_end))
+                    cur = chunk_end + 1
+
+        batches = [[] for _ in range(n_workers)]
+        batch_frames = [0] * n_workers
+        sorted_ranges = sorted(split_ranges, key=lambda r: r[1] - r[0], reverse=True)
+        for rng in sorted_ranges:
+            lightest = min(range(n_workers), key=lambda i: batch_frames[i])
+            batches[lightest].append(rng)
+            batch_frames[lightest] += rng[1] - rng[0] + 1
+        worker_args = [
+            (video_path, sorted(batch), stride, wi)
+            for wi, batch in enumerate(batches) if batch
+        ]
+        print(f"   Parallel face detection: {len(worker_args)} workers, {len(split_ranges)} chunks from {len(active_ranges)} ranges")
+        with ProcessPoolExecutor(max_workers=len(worker_args)) as pool:
+            futures = list(pool.map(_detect_range_worker, worker_args))
+        all_results = [f[0] for f in futures]
+        total_done = sum(f[1] for f in futures)
+        _apply_worker_results(data, all_results, active_ranges, n_frames, default)
+        print(f"   Inference: {total_done} frames (stride={stride}, {total_read} read, {len(worker_args)} workers)")
+
+    return data, fps, (w, h)
+
+
+def smooth_data(data, alpha=0.1):
+    a = np.array(data, dtype=np.float64)
+    o = np.empty_like(a)
+    o[0] = a[0]
+    inv = 1.0 - alpha
+    for i in range(1, len(a)):
+        o[i] = alpha * a[i] + inv * o[i - 1]
+    return o.astype(np.int32)
+
+
+# ─── Selective detection helpers ──────────────────────────────────────────────
+
+
+def _compute_active_frame_ranges(bounces, fps, n_frames, padding_sec=2.0,
+                                  detect_holds=True):
+    """
+    Return sorted list of (start_frame, end_frame) ranges where face detection
+    is needed.  Returns None if no face-dependent events exist.
+    """
+    raw_ranges = []
+    pending_in = None
+    for b in bounces:
+        if isinstance(b, dict):
+            action = b.get("action", "bounce")
+            if action in ("zoom_blur", "whip"):
+                continue
+            if action == "in":
+                if detect_holds:
+                    pending_in = b["start"]
+                    continue
+                else:
+                    raw_ranges.append((b["start"], b["end"]))
+                    continue
+            if action == "out" and pending_in is not None:
+                raw_ranges.append((pending_in, b["end"]))
+                pending_in = None
+                continue
+            if action == "out" and not detect_holds:
+                raw_ranges.append((b["start"], b["end"]))
+                continue
+            start_sec, end_sec = b["start"], b["end"]
+        else:
+            start_sec, end_sec = b[0], b[1]
+        raw_ranges.append((start_sec, end_sec))
+    if pending_in is not None:
+        raw_ranges.append((pending_in, n_frames / fps))
+
+    if not raw_ranges:
+        return None
+
+    frame_ranges = []
+    for start_sec, end_sec in raw_ranges:
+        f_start = max(0, int((start_sec - padding_sec) * fps))
+        f_end = min(n_frames - 1, int(end_sec * fps) + 1)
+        frame_ranges.append((f_start, f_end))
+
+    frame_ranges.sort()
+    merged = [frame_ranges[0]]
+    for s, e in frame_ranges[1:]:
+        if s <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+
+    return merged
+
+
+def _compute_render_ranges(bounces, fps, n_frames):
+    """
+    Return sorted list of (start_frame, end_frame) ranges where any effect
+    is active.  Returns None if no events exist.
+    """
+    raw_ranges = []
+    pending_in = None
+    for b in bounces:
+        if isinstance(b, dict):
+            action = b.get("action", "bounce")
+            if action == "in":
+                pending_in = b["start"]
+                continue
+            if action == "out" and pending_in is not None:
+                raw_ranges.append((pending_in, b["end"]))
+                pending_in = None
+                continue
+            start_sec, end_sec = b["start"], b["end"]
+        else:
+            start_sec, end_sec = b[0], b[1]
+        raw_ranges.append((start_sec, end_sec))
+    if pending_in is not None:
+        raw_ranges.append((pending_in, n_frames / fps))
+
+    if not raw_ranges:
+        return None
+
+    frame_ranges = []
+    for start_sec, end_sec in raw_ranges:
+        f_start = max(0, int(start_sec * fps))
+        f_end = min(n_frames - 1, int(end_sec * fps) + 1)
+        frame_ranges.append((f_start, f_end))
+
+    frame_ranges.sort()
+    merged = [frame_ranges[0]]
+    for s, e in frame_ranges[1:]:
+        if s <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+
+    return merged
+
+cv2.setNumThreads(1)
 
 _HAS_NVCODEC = False
 try:
@@ -60,8 +1020,6 @@ try:
 except ImportError:
     pass
 
-
-# ─── CUDA Kernels ────────────────────────────────────────────────────────────
 
 _WARP_KERNEL = cp.RawKernel(r'''
 extern "C" __global__
@@ -78,7 +1036,6 @@ void affine_warp(
     float src_xf = dx * inv_z + neg_sx_over_z;
     float src_yf = dy * inv_z + neg_sy_over_z;
 
-    // Border replicate
     src_xf = fminf(fmaxf(src_xf, 0.0f), (float)(w - 1));
     src_yf = fminf(fmaxf(src_yf, 0.0f), (float)(h - 1));
 
@@ -116,7 +1073,6 @@ void rgb_to_nv12(
     unsigned char* __restrict__ uv_plane,
     int w, int h
 ) {
-    // Each thread handles one pixel for Y, and contributes to UV at 2x2 blocks
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
@@ -126,13 +1082,10 @@ void rgb_to_nv12(
     float g = (float)rgb[rgb_idx + 1];
     float b = (float)rgb[rgb_idx + 2];
 
-    // BT.601 coefficients (match ffmpeg default)
     float yf =  0.257f * r + 0.504f * g + 0.098f * b + 16.0f;
     y_plane[y * w + x] = (unsigned char)fminf(fmaxf(yf + 0.5f, 0.0f), 255.0f);
 
-    // UV: only top-left pixel of each 2x2 block writes
     if ((x & 1) == 0 && (y & 1) == 0) {
-        // Average the 2x2 block for chroma
         float sum_r = r, sum_g = g, sum_b = b;
         int count = 1;
 
@@ -160,7 +1113,7 @@ void rgb_to_nv12(
         float uf = -0.148f * ar - 0.291f * ag + 0.439f * ab + 128.0f;
         float vf =  0.439f * ar - 0.368f * ag - 0.071f * ab + 128.0f;
 
-        int uv_idx = (y / 2) * w + x;  // interleaved UV, w bytes per row
+        int uv_idx = (y / 2) * w + x;
         uv_plane[uv_idx]     = (unsigned char)fminf(fmaxf(uf + 0.5f, 0.0f), 255.0f);
         uv_plane[uv_idx + 1] = (unsigned char)fminf(fmaxf(vf + 0.5f, 0.0f), 255.0f);
     }
@@ -173,9 +1126,9 @@ void directional_blur(
     const unsigned char* __restrict__ src,
     unsigned char* __restrict__ dst,
     int w, int h,
-    int kernel_radius,  // half-size of box filter
-    float strength,     // blend weight [0,1]
-    int horizontal      // 1=horizontal, 0=vertical
+    int kernel_radius,
+    float strength,
+    int horizontal
 ) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -194,7 +1147,6 @@ void directional_blur(
             sx = x;
             sy = y + k;
         }
-        // Clamp to borders
         sx = max(0, min(sx, w - 1));
         sy = max(0, min(sy, h - 1));
         int si = (sy * w + sx) * 3;
@@ -209,7 +1161,6 @@ void directional_blur(
     float bg = sum_g * inv_c;
     float bb = sum_b * inv_c;
 
-    // Blend: lerp(original, blurred, strength)
     float orig_r = src[idx];
     float orig_g = src[idx + 1];
     float orig_b = src[idx + 2];
@@ -222,8 +1173,6 @@ void directional_blur(
 
 _BLOCK = (16, 16)
 
-
-# ─── GPU Helper Functions ────────────────────────────────────────────────────
 
 def _gpu_warp(g_src, g_dst, w, h, z, sx, sy):
     """Run the affine warp kernel: M = [[z,0,sx],[0,z,sy]]."""
@@ -246,8 +1195,6 @@ def _gpu_rgb_to_nv12(g_rgb, g_y, g_uv, w, h):
                         (g_rgb, g_y, g_uv, np.int32(w), np.int32(h)))
 
 
-# ─── GPUBufferPool ───────────────────────────────────────────────────────────
-
 class GPUBufferPool:
     """Pre-allocate all GPU buffers for active segment rendering.
 
@@ -259,21 +1206,17 @@ class GPUBufferPool:
         self.h = h
         self.w = w
 
-        # Primary uint8 buffers
         self.rgb = cp.empty((h, w, 3), dtype=cp.uint8)
         self.warped = cp.empty((h, w, 3), dtype=cp.uint8)
         self.out = cp.empty((h, w, 3), dtype=cp.uint8)
 
-        # Float32 scratch
         self.warped_f32 = cp.empty((h, w, 3), dtype=cp.float32)
         self.blend_f32 = cp.empty((h, w, 3), dtype=cp.float32)
 
-        # Edge fade
         self.fade_alpha = cp.empty((h, w, 1), dtype=cp.float32)
         self.fade_bg = cp.empty((h, w, 3), dtype=cp.float32)
         self.inv_alpha = cp.empty((h, w, 1), dtype=cp.float32)
 
-        # Zoom blur
         if has_zoom_blur:
             self.blur_accum = cp.empty((h, w, 3), dtype=cp.float32)
             self.blur_sample = cp.empty((h, w, 3), dtype=cp.uint8)
@@ -281,14 +1224,11 @@ class GPUBufferPool:
         else:
             self.blur_accum = self.blur_sample = self.blur_sample_f32 = None
 
-        # Whip
         if has_whip:
             self.whip_dst = cp.empty((h, w, 3), dtype=cp.uint8)
         else:
             self.whip_dst = None
 
-        # Double-buffered NV12 for NVENC overlap
-        # NV12 is a single contiguous buffer: h rows of Y + h/2 rows of interleaved UV
         if need_nv12:
             nv12_h = h + h // 2
             self.nv12_a = cp.empty((nv12_h, w), dtype=cp.uint8)
@@ -296,7 +1236,7 @@ class GPUBufferPool:
         else:
             self.nv12_a = self.nv12_b = None
 
-        self._nv12_ping = True  # toggle for double-buffering
+        self._nv12_ping = True
 
     def get_nv12_buffers(self):
         """Return (nv12_full, y_plane, uv_plane) and toggle for next frame."""
@@ -307,10 +1247,8 @@ class GPUBufferPool:
         return buf, y, uv
 
 
-# ─── GPU Effect Functions (zero-alloc) ───────────────────────────────────────
-
 def _gpu_zoom_blur(pool, g_rgb, w, h, z, sx, sy, strength, n_samples):
-    """GPU zoom blur using pre-allocated pool buffers. Zero transient allocs."""
+    """GPU zoom blur using pre-allocated pool buffers."""
     cx, cy = w / 2.0, h / 2.0
     spread = 0.05 * strength * z
 
@@ -322,13 +1260,11 @@ def _gpu_zoom_blur(pool, g_rgb, w, h, z, sx, sy, strength, n_samples):
         s_sx = sx + cx * (z - sz)
         s_sy = sy + cy * (z - sz)
         _gpu_warp(g_rgb, pool.blur_sample, w, h, sz, s_sx, s_sy)
-        # Accumulate as float32 without .astype() allocation
         cp.copyto(pool.blur_sample_f32, pool.blur_sample, casting='unsafe')
         cp.add(pool.blur_accum, pool.blur_sample_f32, out=pool.blur_accum)
 
     pool.blur_accum /= n_samples
 
-    # Blend: warped + (blur_accum - warped) * strength
     cp.copyto(pool.warped_f32, pool.warped, casting='unsafe')
     cp.subtract(pool.blur_accum, pool.warped_f32, out=pool.blend_f32)
     cp.multiply(pool.blend_f32, strength, out=pool.blend_f32)
@@ -338,7 +1274,7 @@ def _gpu_zoom_blur(pool, g_rgb, w, h, z, sx, sy, strength, n_samples):
 
 
 def _gpu_whip(pool, w, h, strength, direction):
-    """GPU directional blur via CUDA kernel. No CPU fallback."""
+    """GPU directional blur via CUDA kernel."""
     if strength < 0.001:
         return
 
@@ -359,7 +1295,6 @@ def _gpu_edge_fade(pool, g_base_gradient_3ch, w, h, edge_strip, face_side, p):
     """GPU edge fade using pre-allocated pool buffers."""
     CRUSH_H = 6
 
-    # Extract edge band mean per row
     if face_side == "right":
         edge_band = pool.warped[:, :edge_strip].mean(axis=1, dtype=cp.float32)
     else:
@@ -377,15 +1312,12 @@ def _gpu_edge_fade(pool, g_base_gradient_3ch, w, h, edge_strip, face_side, p):
     expanded = cp.repeat(crushed, (h + CRUSH_H - 1) // CRUSH_H, axis=0)[:h]
     pool.fade_bg[:] = expanded.reshape(h, 1, 3)
 
-    # Compute fade alpha
     cp.copyto(pool.warped_f32, pool.warped, casting='unsafe')
     cp.multiply(g_base_gradient_3ch, p, out=pool.fade_alpha)
     pool.fade_alpha += (1.0 - p)
 
-    # Blend: warped * alpha + bg * (1-alpha)
     cp.multiply(pool.warped_f32, pool.fade_alpha, out=pool.blend_f32)
     cp.subtract(1.0, pool.fade_alpha, out=pool.inv_alpha)
-    # fade_bg * inv_alpha -> warped_f32 (reuse as scratch since we already consumed it)
     g_bg_weighted = pool.fade_bg * pool.inv_alpha
     cp.add(pool.blend_f32, g_bg_weighted, out=pool.blend_f32)
     cp.clip(pool.blend_f32, 0, 255, out=pool.blend_f32)
@@ -409,17 +1341,8 @@ def _gpu_overlay_blend(pool, g_ovl_img, g_ovl_mask, opacity, ox, oy, w, h):
     pool.out[y1:y2, x1:x2] = result.astype(cp.uint8)
 
 
-# ─── NV12 Frame wrapper for NVENC GPU input ─────────────────────────────────
-
 class _NV12GPUFrame:
-    """Wraps a contiguous CuPy NV12 buffer for NVENC GPU input.
-
-    The encoder with usecpuinputbuffer=False expects an object that either:
-    - Has __cuda_array_interface__ (like a CuPy array), or
-    - Has a .cuda() method returning [luma_cai, chroma_cai]
-
-    We try both approaches.
-    """
+    """Wraps a contiguous CuPy NV12 buffer for NVENC GPU input."""
 
     def __init__(self, nv12_full, y_plane, uv_plane, width, height):
         self._full = nv12_full
@@ -433,12 +1356,9 @@ class _NV12GPUFrame:
         return self._full.__cuda_array_interface__
 
     def cuda(self):
-        # Encoder expects 3D arrays: Y as (h, w, 1), UV as (h/2, w/2, 2)
         return [self._y.reshape(self._height, self._width, 1),
                 self._uv.reshape(self._height // 2, self._width // 2, 2)]
 
-
-# ─── PyNvVideoCodec render path (zero-copy) ─────────────────────────────────
 
 def _render_active_segment_nvcodec(
     input_path, output_path, frame_start, frame_end,
@@ -451,22 +1371,18 @@ def _render_active_segment_nvcodec(
     seg_p = p_curve[frame_start:frame_end + 1]
     seg_blur = blur_strength[frame_start:frame_end + 1]
     seg_whip = whip_strength[frame_start:frame_end + 1]
-    seg_z = zooms[frame_start:frame_end + 1]
     n_seg = frame_end - frame_start + 1
 
     has_zoom_blur = seg_blur.max() > 0
     has_whip = seg_whip.max() > 0
 
-    # Overlay config
     ovl_pos = overlay_config.get("position", "left") if overlay_config else "left"
     ovl_mg = overlay_config.get("margin", 1.8) if overlay_config else 1.8
 
-    # Gradient fade setup
     need_fade = face_side != "center"
     edge_strip = max(int(w * EDGE_STRIP_FRAC), 1)
     fade_width = int(w * FADE_WIDTH_FRAC)
 
-    # Pre-allocate all GPU buffers
     pool = GPUBufferPool(h, w, has_zoom_blur=has_zoom_blur,
                          has_whip=has_whip, need_nv12=True)
 
@@ -480,22 +1396,18 @@ def _render_active_segment_nvcodec(
             base_gradient[:, w - fade_width:] = ramp[::-1][np.newaxis, :]
         g_base_gradient_3ch = cp.asarray(base_gradient[:, :, np.newaxis])
 
-    # Upload overlay once
     g_ovl_img = g_ovl_mask = None
     if overlay:
         oi, om = overlay.get_frame(0)
         g_ovl_img = cp.asarray(oi)
         g_ovl_mask = cp.asarray(om)
 
-    # NVDEC decoder — outputs RGB directly on GPU
     decoder = nvc.SimpleDecoder(
         input_path, gpu_id=0,
         use_device_memory=True,
         output_color_type=nvc.OutputColorType.RGB,
     )
 
-    # NVENC encoder — accepts GPU NV12 frames
-    # Write raw H.264 bitstream to a temp file, wrap in MP4 after
     raw_h264_path = output_path + ".h264"
     encoder = nvc.CreateEncoder(
         w, h, "NV12",
@@ -513,17 +1425,13 @@ def _render_active_segment_nvcodec(
         z = float(zooms[idx])
         local = idx - frame_start
 
-        # Decode frame from NVDEC (zero-copy GPU surface)
         surface = decoder[idx]
         g_frame = cp.from_dlpack(surface)
 
-        # Handle shape: SimpleDecoder RGB output is (H, W, 3)
         if g_frame.shape != (h, w, 3):
-            # Reshape if needed (e.g., planar format)
             if g_frame.ndim == 3 and g_frame.shape[0] == 3:
                 g_frame = cp.transpose(g_frame, (1, 2, 0))
 
-        # Passthrough: no effects
         if p < 0.001 and blur_strength[idx] < 0.001 and whip_strength[idx] < 0.001:
             cp.copyto(pool.rgb, g_frame)
             nv12_full, nv12_y, nv12_uv = pool.get_nv12_buffers()
@@ -534,12 +1442,10 @@ def _render_active_segment_nvcodec(
                 bitstream_file.write(bytes(bitstream))
             continue
 
-        # Copy decoded frame into pool
         cp.copyto(pool.rgb, g_frame)
 
         t = times[idx]
 
-        # Warp geometry
         fx_raw, fy_raw, fw_raw, fh_raw = face_data[idx]
         if face_data_stable is not None and p > 0.001:
             fx_st = float(face_data_stable[idx][0])
@@ -561,28 +1467,23 @@ def _render_active_segment_nvcodec(
         sfw = fw * z
         sfh = fh * z
 
-        # GPU warp
         _gpu_warp(pool.rgb, pool.warped, w, h, z, sx_val, sy_val)
 
-        # GPU zoom blur
         if has_zoom_blur and blur_strength[idx] > 0.001:
             _gpu_zoom_blur(
                 pool, pool.rgb, w, h, z, sx_val, sy_val,
                 float(blur_strength[idx]), int(blur_n_samples[idx]),
             )
 
-        # GPU whip
         if has_whip and whip_strength[idx] > 0.001:
             _gpu_whip(pool, w, h, float(whip_strength[idx]), whip_direction[idx])
 
-        # GPU edge fade
         if p < 0.001 or not need_fade:
             cp.copyto(pool.out, pool.warped)
         else:
             _gpu_edge_fade(pool, g_base_gradient_3ch, w, h,
                            edge_strip, face_side, p)
 
-        # GPU overlay
         if overlay and overlay_config and p > 0.01:
             opacity = min(p * 3.0, 1.0)
             if opacity > 0:
@@ -604,7 +1505,6 @@ def _render_active_segment_nvcodec(
                 _gpu_overlay_blend(pool, g_ovl_img, g_ovl_mask, opacity,
                                    ox, oy, w, h)
 
-        # Convert to NV12 and encode (stays on GPU)
         nv12_full, nv12_y, nv12_uv = pool.get_nv12_buffers()
         _gpu_rgb_to_nv12(pool.out, nv12_y, nv12_uv, w, h)
         frame_obj = _NV12GPUFrame(nv12_full, nv12_y, nv12_uv, w, h)
@@ -615,13 +1515,16 @@ def _render_active_segment_nvcodec(
         if local % 100 == 0:
             print(f"     frame {local}/{n_seg}", flush=True)
 
-    # Flush encoder
+    rendered = local + 1
+    expected = frame_end - frame_start + 1
+    if rendered < expected:
+        print(f"     WARNING: decoded {rendered}/{expected} frames (segment may be short)", flush=True)
+
     remaining = encoder.EndEncode()
     if remaining:
         bitstream_file.write(bytes(remaining))
     bitstream_file.close()
 
-    # Wrap raw H.264 in MP4 container (stream-copy, very fast)
     subprocess.run(
         ["ffmpeg", "-y", "-i", raw_h264_path,
          "-c:v", "copy", "-an", output_path],
@@ -630,14 +1533,11 @@ def _render_active_segment_nvcodec(
     os.remove(raw_h264_path)
 
 
-# ─── Threaded Decode Prefetch (ffmpeg pipe) ──────────────────────────────────
-
 class _ThreadedDecoder:
     """Decode frames via ffmpeg pipe in a background thread.
 
-    ffmpeg handles any input codec (H.264, AV1, VP9, etc.) and outputs raw
-    RGB24 frames.  The background thread prefetches into a small queue so
-    decode of frame N+1 overlaps GPU compute of frame N.
+    Outputs raw RGB24 frames. The background thread prefetches into a small
+    queue so decode of frame N+1 overlaps GPU compute of frame N.
     """
 
     def __init__(self, input_path, frame_start, frame_end, w, h, fps):
@@ -670,18 +1570,19 @@ class _ThreadedDecoder:
             frame = np.frombuffer(data, dtype=np.uint8).reshape(
                 self._shape).copy()
             self._queue.put((True, frame))
-        self._queue.put((False, None))  # sentinel
+        self._queue.put((False, None))
 
     def read(self):
-        return self._queue.get()
+        try:
+            return self._queue.get(timeout=30)
+        except queue.Empty:
+            return (False, None)
 
     def release(self):
         self._proc.stdout.close()
         self._proc.terminate()
         self._proc.wait()
 
-
-# ─── Fallback render path (cv2 + ffmpeg pipe) ───────────────────────────────
 
 def _render_active_segment_fallback(
     input_path, output_path, frame_start, frame_end,
@@ -697,7 +1598,6 @@ def _render_active_segment_fallback(
     seg_z = zooms[frame_start:frame_end + 1]
     n_seg = frame_end - frame_start + 1
 
-    # Detect hold sub-region
     is_hold = (seg_p > 0.999) & (seg_blur < 0.001) & (seg_whip < 0.001)
     z_range = float(seg_z[is_hold].max() - seg_z[is_hold].min()) if is_hold.any() else 1.0
     is_pure_hold = is_hold.all() and z_range < 0.01 and not overlay and n_seg > int(fps)
@@ -722,7 +1622,6 @@ def _render_active_segment_fallback(
     edge_strip = max(int(w * EDGE_STRIP_FRAC), 1)
     fade_width = int(w * FADE_WIDTH_FRAC)
 
-    # Pre-allocate all GPU buffers via pool (NV12 enabled for pipe output)
     pool = GPUBufferPool(h, w, has_zoom_blur=has_zoom_blur,
                          has_whip=has_whip, need_nv12=True)
 
@@ -747,6 +1646,7 @@ def _render_active_segment_fallback(
     decoder = _ThreadedDecoder(input_path, frame_start, frame_end, w, h, fps)
     writer = open_ffmpeg_writer(output_path, w, h, fps, enc, pix_fmt="nv12")
 
+    _rendered_count = 0
     for idx in range(frame_start, frame_end + 1):
         ok, rgb = decoder.read()
         if not ok:
@@ -755,9 +1655,9 @@ def _render_active_segment_fallback(
         p = float(p_curve[idx])
         z = float(zooms[idx])
         local = idx - frame_start
+        _rendered_count = local + 1
 
         if p < 0.001 and blur_strength[idx] < 0.001 and whip_strength[idx] < 0.001:
-            # Passthrough: still need NV12 conversion for pipe format
             pool.rgb[:] = cp.asarray(rgb)
             nv12_full, nv12_y, nv12_uv = pool.get_nv12_buffers()
             _gpu_rgb_to_nv12(pool.rgb, nv12_y, nv12_uv, w, h)
@@ -828,7 +1728,6 @@ def _render_active_segment_fallback(
                 _gpu_overlay_blend(pool, g_ovl_img, g_ovl_mask, opacity,
                                    ox, oy, w, h)
 
-        # Convert to NV12 on GPU, download smaller buffer (50% of RGB)
         nv12_full, nv12_y, nv12_uv = pool.get_nv12_buffers()
         _gpu_rgb_to_nv12(pool.out, nv12_y, nv12_uv, w, h)
         cp.asnumpy(nv12_full, out=buf_nv12_cpu)
@@ -837,18 +1736,14 @@ def _render_active_segment_fallback(
         if local % 100 == 0:
             print(f"     frame {local}/{n_seg}", flush=True)
 
+    expected = frame_end - frame_start + 1
+    if _rendered_count < expected:
+        print(f"     WARNING: decoded {rendered}/{expected} frames (segment may be short)", flush=True)
+
     decoder.release()
     writer.stdin.close()
     writer.wait()
 
-
-# ─── Unified render dispatch ────────────────────────────────────────────────
-
-# NOTE: The PyNvVideoCodec (NVDEC/NVENC) zero-copy path is disabled because
-# SimpleDecoder random-access decoding causes frame corruption (bad keyframe
-# seeking, timing issues). Instead we use cv2 decode + ffmpeg h264_nvenc pipe
-# which the BtbN ffmpeg build supports. This gives us HW encode without the
-# decode-side issues.
 
 def _render_active_segment_gpu(
     input_path, output_path, frame_start, frame_end,
@@ -867,9 +1762,6 @@ def _render_active_segment_gpu(
     )
 
 
-# ─── GPU segment pipeline (mirrors _run_segment_pipeline) ───────────────────
-
-
 def _run_segment_pipeline_gpu(
     input_path, output_path, render_ranges, n_frames, fps,
     face_data, face_data_stable, p_curve, zooms,
@@ -877,8 +1769,7 @@ def _run_segment_pipeline_gpu(
     times, overlay, overlay_config, face_side, dest_x_full,
     stabilize, debug_labels, w, h, enc, src_codec="h264",
 ):
-    """GPU version of _run_segment_pipeline — uses _render_active_segment_gpu."""
-    import bisect
+    """GPU version of _run_segment_pipeline."""
     tmp_dir = tempfile.mkdtemp(prefix="zb_seg_")
     segments = []
     seg_idx = 0
@@ -917,26 +1808,20 @@ def _run_segment_pipeline_gpu(
                         segments.append((seg_path, "active", snapped_end_kf, pass_end))
                         seg_idx += 1
                 else:
-                    # Keyframes exist but snapping failed — still passthrough
-                    seg_path = os.path.join(tmp_dir, f"seg_{seg_idx:04d}_pass.mp4")
-                    segments.append((seg_path, "passthrough", pass_start, pass_end))
+                    seg_path = os.path.join(tmp_dir, f"seg_{seg_idx:04d}_active.mp4")
+                    segments.append((seg_path, "active", pass_start, pass_end))
                     seg_idx += 1
             else:
-                # No keyframe info — passthrough anyway, ffmpeg handles it
-                seg_path = os.path.join(tmp_dir, f"seg_{seg_idx:04d}_pass.mp4")
-                segments.append((seg_path, "passthrough", pass_start, pass_end))
+                seg_path = os.path.join(tmp_dir, f"seg_{seg_idx:04d}_active.mp4")
+                segments.append((seg_path, "active", pass_start, pass_end))
                 seg_idx += 1
 
-        # Split active range into multiple hold sub-regions.
-        # Find contiguous runs of hold frames (p≈1, no effects) with constant
-        # zoom, and extract each as an ffmpeg crop+scale segment.
         seg_p = p_curve[rng_start:rng_end + 1]
         seg_blur = blur_strength[rng_start:rng_end + 1]
         seg_whip = whip_strength[rng_start:rng_end + 1]
         is_hold = (seg_p > 0.999) & (seg_blur < 0.001) & (seg_whip < 0.001)
 
-        # Find contiguous hold runs and check each for constant zoom
-        hold_runs = []  # list of (local_start, local_end) for valid holds
+        hold_runs = []
         if not overlay:
             in_run = False
             run_start = 0
@@ -947,14 +1832,12 @@ def _run_segment_pipeline_gpu(
                 elif not is_hold[li] and in_run:
                     run_end = li - 1
                     if run_end - run_start + 1 > min_hold_frames:
-                        # Check constant zoom within this run
                         abs_s = rng_start + run_start
                         abs_e = rng_start + run_end
                         run_z = zooms[abs_s:abs_e + 1]
                         if float(run_z.max() - run_z.min()) < 0.01:
                             hold_runs.append((run_start, run_end))
                     in_run = False
-            # Close final run
             if in_run:
                 run_end = len(is_hold) - 1
                 if run_end - run_start + 1 > min_hold_frames:
@@ -965,24 +1848,20 @@ def _run_segment_pipeline_gpu(
                         hold_runs.append((run_start, run_end))
 
         if hold_runs:
-            # Emit active/hold segments in order
-            cursor = 0  # local offset within this render range
+            cursor = 0
             for hold_start, hold_end in hold_runs:
-                # Active segment before this hold
                 if hold_start > cursor:
                     abs_s = rng_start + cursor
                     abs_e = rng_start + hold_start - 1
                     seg_path = os.path.join(tmp_dir, f"seg_{seg_idx:04d}_active.mp4")
                     segments.append((seg_path, "active", abs_s, abs_e))
                     seg_idx += 1
-                # Hold segment (rendered via ffmpeg crop+scale)
                 abs_s = rng_start + hold_start
                 abs_e = rng_start + hold_end
                 seg_path = os.path.join(tmp_dir, f"seg_{seg_idx:04d}_active.mp4")
                 segments.append((seg_path, "active", abs_s, abs_e))
                 seg_idx += 1
                 cursor = hold_end + 1
-            # Trailing active after last hold
             if cursor <= rng_end - rng_start:
                 abs_s = rng_start + cursor
                 seg_path = os.path.join(tmp_dir, f"seg_{seg_idx:04d}_active.mp4")
@@ -996,7 +1875,6 @@ def _run_segment_pipeline_gpu(
         seg_idx += 1
         prev_end = rng_end + 1
 
-    # Trailing passthrough
     if prev_end < n_frames:
         pass_start = prev_end
         pass_end = n_frames - 1
@@ -1011,13 +1889,12 @@ def _run_segment_pipeline_gpu(
                 segments.append((seg_path, "passthrough", snapped_start, pass_end))
                 seg_idx += 1
             else:
-                # Snapping failed — still passthrough
-                seg_path = os.path.join(tmp_dir, f"seg_{seg_idx:04d}_pass.mp4")
-                segments.append((seg_path, "passthrough", pass_start, pass_end))
+                seg_path = os.path.join(tmp_dir, f"seg_{seg_idx:04d}_active.mp4")
+                segments.append((seg_path, "active", pass_start, pass_end))
                 seg_idx += 1
         else:
-            seg_path = os.path.join(tmp_dir, f"seg_{seg_idx:04d}_pass.mp4")
-            segments.append((seg_path, "passthrough", pass_start, pass_end))
+            seg_path = os.path.join(tmp_dir, f"seg_{seg_idx:04d}_active.mp4")
+            segments.append((seg_path, "active", pass_start, pass_end))
             seg_idx += 1
 
     n_pass = sum(1 for _, t, *_ in segments if t == "passthrough")
@@ -1028,9 +1905,7 @@ def _run_segment_pipeline_gpu(
 
     t0 = time.monotonic()
 
-    # Extract passthrough segments in parallel
     pass_segs = [(s, fs, fe) for s, typ, fs, fe in segments if typ == "passthrough"]
-    # Determine encoder codec family (e.g. "h264_nvenc" -> "h264")
     enc_codec = enc.split("_")[0] if "_" in enc else enc
     need_reencode = src_codec != enc_codec
     if pass_segs:
@@ -1044,7 +1919,6 @@ def _run_segment_pipeline_gpu(
         mode = "re-encoded" if need_reencode else "stream-copied"
         print(f"   Passthrough segments: {len(pass_segs)} {mode} ({total_pass_frames} frames) in {time.monotonic() - t0:.1f}s")
 
-    # Render active segments with GPU
     t1 = time.monotonic()
     active_segs = [(s, fs, fe) for s, typ, fs, fe in segments if typ == "active"]
     total_active_frames = sum(fe - fs + 1 for _, fs, fe in active_segs)
@@ -1063,24 +1937,18 @@ def _run_segment_pipeline_gpu(
     elapsed_render = time.monotonic() - t1
     print(f"   Active segments: {len(active_segs)} rendered ({total_active_frames} frames) in {elapsed_render:.1f}s ({total_active_frames / max(elapsed_render, 0.01):.1f} fps) [{codec_label}]")
 
-    # Concat all segments
     segment_paths = [s for s, *_ in segments]
     tmp_concat = os.path.join(tmp_dir, "concat_silent.mp4")
     _concat_segments(segment_paths, tmp_concat)
 
-    # Mux audio
     print("3. Muxing audio ...")
     mux_audio(input_path, tmp_concat, output_path)
 
-    # Cleanup
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
     total = time.monotonic() - t0
     print(f"   Total segment pipeline: {total:.1f}s")
     print(f"Done -> {output_path}")
-
-
-# ─── Main entry point ────────────────────────────────────────────────────────
 
 
 def create_zoom_bounce_effect(
@@ -1165,7 +2033,6 @@ def create_zoom_bounce_effect(
 
     src_codec = _probe_source_codec(input_path)
 
-    # Overlay prep
     overlay = None
     if overlay_config:
         if overlay_config.get("type", "text") == "text":
@@ -1200,12 +2067,9 @@ def create_zoom_bounce_effect(
     else:
         dest_x_full = w * 0.72
 
-    # Try to match source codec (enables stream-copy passthrough). Fall back
-    # to H.264 if no HW encoder is available for the source codec.
     enc = detect_best_encoder(src_codec)
     _HW_SUFFIXES = ("_nvenc", "_videotoolbox", "_qsv")
     if not any(enc.endswith(s) for s in _HW_SUFFIXES):
-        # Software encoder for source codec — fall back to H.264 HW
         enc = detect_best_encoder("h264")
 
     render_frames = sum(e - s + 1 for s, e in render_ranges)
