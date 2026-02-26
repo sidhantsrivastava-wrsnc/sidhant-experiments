@@ -434,7 +434,7 @@ def _probe_encoder(name):
                 "-f",
                 "lavfi",
                 "-i",
-                "color=black:s=256x256:d=0.04",
+                "color=black:s=64x64:d=0.04",
                 "-c:v",
                 name,
                 "-f",
@@ -742,36 +742,17 @@ def _frame_in_ranges(idx, ranges):
 def _detect_range_worker(args):
     """
     Worker function for parallel face detection.  Each worker opens its own
-    ffmpeg pipe decoder and FaceLandmarker to process a batch of active ranges.
+    VideoCapture and FaceLandmarker to process a batch of active ranges.
     Must be a top-level function for pickling by ProcessPoolExecutor.
-
-    Uses ffmpeg pipe for frame decoding to support any input codec (H.264,
-    AV1, VP9, etc.) without relying on cv2's backend.
 
     Returns: list of (frame_index, (cx, cy, fw, fh)) for every frame in
     the assigned ranges (interpolated at stride intervals).
     """
     video_path, ranges_batch, stride, worker_id = args
-    import subprocess as _sp
+    import cv2 as _cv2
+    _cv2.setNumThreads(1)
     import mediapipe as _mp
     from mediapipe.tasks.python import vision as _vision, BaseOptions as _BO
-
-    # Probe video dimensions via ffprobe
-    _probe = _sp.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=width,height,r_frame_rate",
-         "-of", "csv=p=0", video_path],
-        capture_output=True, text=True,
-    )
-    parts = _probe.stdout.strip().split(",")
-    w, h = int(parts[0]), int(parts[1])
-    # Parse frame rate (e.g. "30000/1001" or "30")
-    fps_str = parts[2]
-    if "/" in fps_str:
-        num, den = fps_str.split("/")
-        fps = float(num) / float(den)
-    else:
-        fps = float(fps_str)
 
     opts = _vision.FaceLandmarkerOptions(
         base_options=_BO(model_asset_path=MODEL_PATH),
@@ -782,32 +763,26 @@ def _detect_range_worker(args):
         min_tracking_confidence=0.5,
     )
     lm = _vision.FaceLandmarker.create_from_options(opts)
+    cap = _cv2.VideoCapture(video_path)
+    w, h = int(cap.get(3)), int(cap.get(4))
+    fps = cap.get(_cv2.CAP_PROP_FPS)
     default = (w // 2, h // 2, 100, 100)
     last_detected = default
     results = []  # (frame_index, value) pairs
     done_infer = 0
     total_infer = sum((e - s) // stride + 1 for s, e in ranges_batch)
-    frame_size = w * h * 3
 
     for rng_start, rng_end in ranges_batch:
-        n_frames = rng_end - rng_start + 1
-        t_start = rng_start / fps
-        cmd = [
-            "ffmpeg", "-ss", str(t_start), "-i", video_path,
-            "-frames:v", str(n_frames),
-            "-f", "rawvideo", "-pix_fmt", "rgb24",
-            "pipe:1",
-        ]
-        proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.DEVNULL)
+        cap.set(_cv2.CAP_PROP_POS_FRAMES, rng_start)
         key_indices = []
         key_vals = []
         for idx in range(rng_start, rng_end + 1):
-            data = proc.stdout.read(frame_size)
-            if len(data) != frame_size:
+            ok, bgr = cap.read()
+            if not ok:
                 break
             run_detect = (idx - rng_start) % stride == 0 or idx == rng_end
             if run_detect:
-                rgb = np.frombuffer(data, dtype=np.uint8).reshape(h, w, 3)
+                rgb = _cv2.cvtColor(bgr, _cv2.COLOR_BGR2RGB)
                 ts_ms = int(idx * 1000 / fps)
                 res = lm.detect_for_video(
                     _mp.Image(image_format=_mp.ImageFormat.SRGB, data=rgb),
@@ -828,9 +803,6 @@ def _detect_range_worker(args):
                 if done_infer % 50 == 0:
                     print(f"   [worker {worker_id}] detect {done_infer}/{total_infer}", flush=True)
 
-        proc.stdout.close()
-        proc.wait()
-
         # Interpolate skipped frames within this range
         if len(key_indices) >= 2:
             ki = np.array(key_indices, dtype=np.float64)
@@ -847,6 +819,7 @@ def _detect_range_worker(args):
         # Carry last_detected for gap-fill info
         results.append(("last", rng_end, last_detected))
 
+    cap.release()
     lm.close()
     return results, done_infer
 
@@ -1051,14 +1024,14 @@ FADE_WIDTH_FRAC = 0.25
 # ─── FFmpeg writer ───────────────────────────────────────────────────────────
 
 
-def open_ffmpeg_writer(path, w, h, fps, enc, pix_fmt="rgb24"):
+def open_ffmpeg_writer(path, w, h, fps, enc):
     cmd = [
         "ffmpeg",
         "-y",
         "-f",
         "rawvideo",
         "-pix_fmt",
-        pix_fmt,
+        "rgb24",
         "-s",
         f"{w}x{h}",
         "-r",
@@ -1067,11 +1040,11 @@ def open_ffmpeg_writer(path, w, h, fps, enc, pix_fmt="rgb24"):
         "pipe:0",
         "-c:v",
         enc,
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
     ]
-    # NV12 is already YUV — no conversion needed by ffmpeg
-    if pix_fmt != "nv12":
-        cmd += ["-pix_fmt", "yuv420p"]
-    cmd += ["-movflags", "+faststart"]
     if enc == "libx264":
         cmd += ["-preset", "fast", "-crf", "18"]
     elif enc == "h264_nvenc":
@@ -1194,30 +1167,13 @@ def _probe_keyframe_times(video_path):
     return sorted(times)
 
 
-def _extract_passthrough(input_path, output_path, t_start, t_end, enc,
-                         reencode=False):
-    """Extract passthrough segment. Stream-copy when possible, re-encode when
-    source codec differs from output codec (e.g. AV1 source + h264_nvenc)."""
-    if reencode:
-        cmd = [
-            "ffmpeg", "-y", "-ss", str(t_start), "-to", str(t_end),
-            "-i", input_path, "-c:v", enc, "-an",
-        ]
-        if enc == "h264_nvenc":
-            cmd += ["-preset", "p4", "-rc", "vbr", "-cq", "20"]
-        elif enc == "h264_videotoolbox":
-            cmd += ["-q:v", "65"]
-        elif enc == "hevc_nvenc":
-            cmd += ["-preset", "p4", "-rc", "vbr", "-cq", "22"]
-        else:
-            cmd += ["-preset", "fast", "-crf", "18"]
-        cmd.append(output_path)
-    else:
-        cmd = [
-            "ffmpeg", "-y", "-ss", str(t_start), "-to", str(t_end),
-            "-i", input_path, "-c:v", "copy", "-an",
-            output_path,
-        ]
+def _extract_passthrough(input_path, output_path, t_start, t_end, enc):
+    """Stream-copy passthrough segment (keyframe-aligned boundaries)."""
+    cmd = [
+        "ffmpeg", "-y", "-ss", str(t_start), "-to", str(t_end),
+        "-i", input_path, "-c:v", "copy", "-an",
+        output_path,
+    ]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
 
 
