@@ -13,8 +13,21 @@ import argparse
 import time
 from pathlib import Path
 
-from zoom_bounce import create_zoom_bounce_effect
-from zoom_bounce_nuclear import create_zoom_bounce_effect_nuclear
+def _load_renderers():
+    """Lazy-load renderers to avoid heavy imports at module level."""
+    from zoom_bounce import create_zoom_bounce_effect
+
+    try:
+        from zoom_bounce_nuclear import create_zoom_bounce_effect_nuclear
+    except ImportError:
+        create_zoom_bounce_effect_nuclear = None
+
+    try:
+        from zoom_bounce_gpu import create_zoom_bounce_effect as create_zoom_bounce_effect_gpu
+    except ImportError:
+        create_zoom_bounce_effect_gpu = None
+
+    return create_zoom_bounce_effect, create_zoom_bounce_effect_nuclear, create_zoom_bounce_effect_gpu
 
 
 TEST_CASES = [
@@ -227,6 +240,65 @@ TEST_CASES = [
             ],
         },
     },
+    {
+        # bansi_SAM_6_minutes.mp4 duration: ~310.68s (5m 11s), 4K 3840x2160, h264
+        "name": "really_big_vid",
+        "input_path": "really_big_vid.mp4",
+        "output_template": "{stem}_big_{ts}.mp4",
+        "kwargs": {
+            "stabilize": 0,
+            "debug_labels": True,
+            "bounces": [
+                {"action": "in", "start": 8.0, "end": 8.5, "ease": "snap", "zoom": 1.4},
+                {"action": "out", "start": 16.0, "end": 16.6, "ease": "smooth"},
+                {
+                    "action": "bounce",
+                    "start": 40.0,
+                    "end": 41.5,
+                    "ease": "smooth",
+                    "zoom": 1.3,
+                },
+                {
+                    "action": "zoom_blur",
+                    "start": 40.2,
+                    "end": 41.3,
+                    "intensity": 1.0,
+                    "n_samples": 8,
+                },
+                {
+                    "action": "whip",
+                    "start": 75.0,
+                    "end": 75.5,
+                    "direction": "h",
+                    "intensity": 1.0,
+                },
+                {
+                    "action": "in",
+                    "start": 120.0,
+                    "end": 120.4,
+                    "ease": "overshoot",
+                    "zoom": 1.45,
+                },
+                {"action": "out", "start": 140.0, "end": 140.5, "ease": "snap"},
+                {
+                    "action": "bounce",
+                    "start": 200.0,
+                    "end": 201.5,
+                    "ease": "overshoot",
+                    "zoom": 1.35,
+                },
+                {
+                    "action": "whip",
+                    "start": 240.0,
+                    "end": 240.4,
+                    "direction": "v",
+                    "intensity": 0.85,
+                },
+                {"action": "in", "start": 280.0, "end": 280.6, "ease": "smooth", "zoom": 1.38},
+                {"action": "out", "start": 300.0, "end": 300.5, "ease": "overshoot"},
+            ],
+        },
+    },
 ]
 
 
@@ -247,6 +319,11 @@ def parse_args() -> argparse.Namespace:
         "--nuclear",
         action="store_true",
         help="Use nuclear (zero-copy FFmpeg) renderer instead of original",
+    )
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="Use GPU (CuPy + h264_nvenc) renderer",
     )
     parser.add_argument(
         "--skip-missing",
@@ -274,13 +351,29 @@ def main() -> None:
     args = parse_args()
     ts = int(time.time())
     base_dir = Path(__file__).resolve().parent
+    input_dir = base_dir / "inputs"
+    output_dir = base_dir / "outputs"
+    output_dir.mkdir(exist_ok=True)
     selected = resolve_cases(args)
 
-    effect_fn = create_zoom_bounce_effect_nuclear if args.nuclear else create_zoom_bounce_effect
-    mode_label = "nuclear" if args.nuclear else "original"
+    create_zoom_bounce_effect, create_zoom_bounce_effect_nuclear, create_zoom_bounce_effect_gpu = _load_renderers()
+
+    if args.gpu:
+        if create_zoom_bounce_effect_gpu is None:
+            raise ImportError("GPU renderer unavailable (cupy not installed — requires NVIDIA GPU)")
+        effect_fn = create_zoom_bounce_effect_gpu
+        mode_label = "gpu"
+    elif args.nuclear:
+        if create_zoom_bounce_effect_nuclear is None:
+            raise ImportError("Nuclear renderer unavailable (zoom_bounce_nuclear not found)")
+        effect_fn = create_zoom_bounce_effect_nuclear
+        mode_label = "nuclear"
+    else:
+        effect_fn = create_zoom_bounce_effect
+        mode_label = "original"
     print(f"Running {len(selected)} case(s) [{mode_label}]")
     for case in selected:
-        input_path = base_dir / case["input_path"]
+        input_path = input_dir / case["input_path"]
         if not input_path.exists():
             msg = f"Input missing for case '{case['name']}': {input_path}"
             if args.skip_missing:
@@ -289,7 +382,7 @@ def main() -> None:
             raise FileNotFoundError(msg)
 
         output_name = case["output_template"].format(stem=input_path.stem, ts=ts)
-        output_path = base_dir / output_name
+        output_path = output_dir / output_name
 
         print(f"\n=== {case['name']} ===")
         print(f"Input:  {input_path}")

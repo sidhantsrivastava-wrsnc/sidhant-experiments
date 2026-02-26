@@ -1510,6 +1510,7 @@ def _render_active_segment(
     buf_fade_alpha = np.empty((h, w, 1), dtype=np.float32)
     buf_blend = np.empty((h, w, 3), dtype=np.float32)
     fade_bg_buf = np.empty((h, w, 3), dtype=np.float32)
+    buf_nv12 = np.empty((h + h // 2, w), dtype=np.uint8)
     if has_zoom_blur:
         buf_blur_accum = np.empty((h, w, 3), dtype=np.float32)
         buf_blur_sample = np.empty((h, w, 3), dtype=np.uint8)
@@ -1524,7 +1525,7 @@ def _render_active_segment(
         buf_ovl_roi = np.empty((oh, ow_, 3), dtype=np.float32)
 
     decoder = _ThreadedDecoder(input_path, frame_start, frame_end, w, h, fps)
-    writer = open_ffmpeg_writer(output_path, w, h, fps, enc)
+    writer = open_ffmpeg_writer(output_path, w, h, fps, enc, pix_fmt="nv12")
 
     for idx in range(frame_start, frame_end + 1):
         ok, rgb = decoder.read()
@@ -1537,7 +1538,8 @@ def _render_active_segment(
 
         # Passthrough within active segment (frame has no actual effect)
         if p < 0.001 and blur_strength[idx] < 0.001 and whip_strength[idx] < 0.001:
-            writer.stdin.write(rgb.data)
+            _rgb_to_nv12(rgb, buf_nv12)
+            writer.stdin.write(buf_nv12.data)
             continue
         t = times[idx]
 
@@ -1636,7 +1638,8 @@ def _render_active_segment(
                 labels.append("whip")
             _draw_debug_label(buf_out, labels, h)
 
-        writer.stdin.write(buf_out.data)
+        _rgb_to_nv12(buf_out, buf_nv12)
+        writer.stdin.write(buf_nv12.data)
         if local % 100 == 0:
             print(f"     frame {local}/{n_seg}", flush=True)
 

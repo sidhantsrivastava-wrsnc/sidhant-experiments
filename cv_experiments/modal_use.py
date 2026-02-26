@@ -1,43 +1,27 @@
 import modal
 
+from modal_config import GPU_PROD, LOCAL_SRC_DIR, REMOTE_SRC_DIR, TIMEOUT_PROD, base_image
+
 app = modal.App("zoom-bounce")
 
-image = (
-    modal.Image.from_registry("nvidia/cuda:12.2.0-runtime-ubuntu22.04", add_python="3.10")
-    .env({"NVIDIA_DRIVER_CAPABILITIES": "compute,video,utility"})
-    .apt_install("libgl1", "libglib2.0-0", "wget", "xz-utils")
-    .run_commands(
-        # BtbN static ffmpeg with NVENC support (GPL build)
-        "wget -q https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
-        "ffmpeg-master-latest-linux64-gpl.tar.xz -O /tmp/ff.tar.xz"
-        " && tar xf /tmp/ff.tar.xz -C /opt"
-        " && ln -sf /opt/ffmpeg-master-latest-linux64-gpl/bin/ffmpeg /usr/local/bin/ffmpeg"
-        " && ln -sf /opt/ffmpeg-master-latest-linux64-gpl/bin/ffprobe /usr/local/bin/ffprobe"
-        " && rm /tmp/ff.tar.xz",
-    )
-    .pip_install(
-        "opencv-python-headless", "numpy", "mediapipe",
-        "moviepy==1.0.3", "cupy-cuda12x", "PyNvVideoCodec",
-    )
-    .add_local_dir(
-        "/Users/sidhant/sidhant-experiments/cv_experiments",
-        remote_path="/root/cv_experiments",
-    )
-)
+image = base_image.add_local_dir(LOCAL_SRC_DIR, remote_path=REMOTE_SRC_DIR)
 
 
 @app.function(
     image=image,
-    gpu="L40S",
-    timeout=1800,
+    gpu=GPU_PROD,
+    timeout=TIMEOUT_PROD,
 )
-def run_zoom_bounce(input_filename: str, output_filename: str, **kwargs):
+def run_zoom_bounce(input_bytes: bytes, output_filename: str, **kwargs):
     import sys
     sys.path.insert(0, "/root/cv_experiments")
     from zoom_bounce_gpu import create_zoom_bounce_effect
 
-    input_path = f"/root/cv_experiments/{input_filename}"
+    input_path = f"/tmp/input_{output_filename}"
     output_path = f"/tmp/{output_filename}"
+
+    with open(input_path, "wb") as f:
+        f.write(input_bytes)
 
     create_zoom_bounce_effect(input_path, output_path, **kwargs)
 
@@ -46,31 +30,58 @@ def run_zoom_bounce(input_filename: str, output_filename: str, **kwargs):
 
 
 @app.local_entrypoint()
-def main():
-    result_bytes = run_zoom_bounce.remote(
-        input_filename="extremelylongvid.mp4",
-        output_filename="extremelylongvid_gpu_output.mp4",
-        stabilize=0,
-        debug_labels=True,
-        bounces=[
-            {"action": "in", "start": 5.0, "end": 5.5, "ease": "smooth", "zoom": 1.35},
-            {"action": "out", "start": 15.0, "end": 15.5, "ease": "snap"},
-            {"action": "bounce", "start": 30.0, "end": 31.0, "ease": "overshoot", "zoom": 1.32},
-            {"action": "zoom_blur", "start": 50.0, "end": 50.7, "intensity": 0.95, "n_samples": 7},
-            {"action": "whip", "start": 75.0, "end": 75.4, "direction": "v", "intensity": 0.9},
-            {"action": "in", "start": 100.0, "end": 100.5, "ease": "snap", "zoom": 1.38},
-            {"action": "bounce", "start": 150.0, "end": 151.0, "ease": "smooth", "zoom": 1.28},
-            {"action": "out", "start": 200.0, "end": 200.5, "ease": "smooth"},
-            {"action": "in", "start": 300.0, "end": 300.5, "ease": "snap", "zoom": 1.4},
-            {"action": "bounce", "start": 400.0, "end": 401.0, "ease": "overshoot", "zoom": 1.3},
-            {"action": "whip", "start": 500.0, "end": 500.4, "direction": "h", "intensity": 0.85},
-            {"action": "out", "start": 600.0, "end": 600.5, "ease": "smooth"},
-            {"action": "in", "start": 800.0, "end": 800.5, "ease": "smooth", "zoom": 1.35},
-            {"action": "bounce", "start": 1000.0, "end": 1001.0, "ease": "snap", "zoom": 1.32},
-            {"action": "out", "start": 1200.0, "end": 1200.5, "ease": "smooth"},
-        ],
-    )
+def main(case: str = None, all: bool = False, skip_missing: bool = True):
+    import os
+    import time
+    import sys
 
-    with open("extremelylongvid_gpu_output.mp4", "wb") as f:
-        f.write(result_bytes)
-    print("Done! Saved extremelylongvid_gpu_output.mp4")
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from zoom_bounce_test_runner import TEST_CASES
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    input_dir = os.path.join(base_dir, "inputs")
+    output_dir = os.path.join(base_dir, "outputs")
+    os.makedirs(output_dir, exist_ok=True)
+
+    if all:
+        selected = TEST_CASES
+    elif case:
+        selected = [c for c in TEST_CASES if c["name"] == case]
+        if not selected:
+            names = [c["name"] for c in TEST_CASES]
+            raise ValueError(f"Unknown case: {case!r}. Available: {names}")
+    else:
+        raise ValueError("Pass --case <name> or --all")
+
+    ts = int(time.time())
+    print(f"Running {len(selected)} case(s) on Modal [gpu]")
+
+    for tc in selected:
+        input_path = os.path.join(input_dir, tc["input_path"])
+        if not os.path.exists(input_path):
+            msg = f"Input missing for case '{tc['name']}': {input_path}"
+            if skip_missing:
+                print(f"SKIP: {msg}")
+                continue
+            raise FileNotFoundError(msg)
+
+        stem = os.path.splitext(tc["input_path"])[0]
+        output_name = tc["output_template"].format(stem=stem, ts=ts)
+        output_path = os.path.join(output_dir, output_name)
+
+        print(f"\n=== {tc['name']} ===")
+        print(f"Input:  {input_path} ({os.path.getsize(input_path) / 1e6:.1f} MB)")
+        print(f"Output: {output_path}")
+
+        with open(input_path, "rb") as f:
+            video_bytes = f.read()
+
+        result_bytes = run_zoom_bounce.remote(
+            input_bytes=video_bytes,
+            output_filename=output_name,
+            **tc["kwargs"],
+        )
+
+        with open(output_path, "wb") as f:
+            f.write(result_bytes)
+        print(f"Done! Saved {output_path}")
