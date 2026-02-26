@@ -5,14 +5,15 @@ Deploy:   modal deploy modal_prod.py
 Test:     curl -X POST https://<app-url>/process -d '{"input_filename": "clip.mp4", ...}'
 
 Features:
-  - Class-based with lifecycle hooks (pre-import heavy libs once)
-  - L40S GPU, 30-min timeout, retries with backoff
+  - Two GPU-tier classes: ZoomBounceL4 (standard) and ZoomBounceL40S (premium)
+  - Auto-routing by video size, explicit tier selection, and fallback chain
   - Three HTTP endpoints: /process (sync), /submit (async), /status (poll)
   - TODO: swap add_local_dir for S3 mount when ready
 """
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any
 
@@ -20,13 +21,16 @@ import modal
 from pydantic import BaseModel, Field
 
 from modal_config import (
-    GPU_PROD,
+    DEFAULT_TIER,
+    FALLBACK_ORDER,
+    GPU_TIERS,
     LOCAL_SRC_DIR,
     REMOTE_SRC_DIR,
-    SCALEDOWN_PROD,
     TIMEOUT_PROD,
     base_image,
 )
+
+logger = logging.getLogger(__name__)
 
 # Prod image: base + local source code
 # TODO: replace add_local_dir with S3 mount when ready
@@ -49,17 +53,20 @@ class ProcessRequest(BaseModel):
     input_path: str | None = Field(None, description="Absolute path to the input video inside the container")
     input_url: str | None = Field(None, description="URL to download the input video from (e.g. presigned S3 URL)")
     output_filename: str | None = Field(None, description="Output filename (auto-generated if omitted)")
+    gpu_tier: str | None = Field(None, description='GPU tier: "standard" (L4), "premium" (L40S), or null for auto-routing by video size')
     kwargs: dict[str, Any] = Field(default_factory=dict, description="Extra kwargs for create_zoom_bounce_effect")
 
 
 class ProcessResponse(BaseModel):
     output_filename: str
     status: str = "completed"
+    gpu_tier: str | None = None
 
 
 class JobSubmitResponse(BaseModel):
     call_id: str
     status: str = "submitted"
+    gpu_tier: str | None = None
 
 
 class JobStatusResponse(BaseModel):
@@ -70,16 +77,19 @@ class JobStatusResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Processor class
+# Processor classes — one per GPU tier, identical logic
 # ---------------------------------------------------------------------------
+_RETRIES = modal.Retries(max_retries=2, backoff_coefficient=2.0, initial_delay=5.0)
+
+
 @app.cls(
     image=image,
-    gpu=GPU_PROD,
-    timeout=TIMEOUT_PROD,
-    scaledown_window=SCALEDOWN_PROD,
-    retries=modal.Retries(max_retries=2, backoff_coefficient=2.0, initial_delay=5.0),
+    gpu=GPU_TIERS["standard"]["gpu"],
+    timeout=GPU_TIERS["standard"]["timeout"],
+    scaledown_window=GPU_TIERS["standard"]["scaledown"],
+    retries=_RETRIES,
 )
-class ZoomBounceProcessor:
+class ZoomBounceL4:
     @modal.enter()
     def setup(self):
         """Pre-import heavy libraries once per container start."""
@@ -107,6 +117,97 @@ class ZoomBounceProcessor:
 
         with open(output_path, "rb") as f:
             return f.read()
+
+
+@app.cls(
+    image=image,
+    gpu=GPU_TIERS["premium"]["gpu"],
+    timeout=GPU_TIERS["premium"]["timeout"],
+    scaledown_window=GPU_TIERS["premium"]["scaledown"],
+    retries=_RETRIES,
+)
+class ZoomBounceL40S:
+    @modal.enter()
+    def setup(self):
+        """Pre-import heavy libraries once per container start."""
+        import sys
+        sys.path.insert(0, "/root/cv_experiments")
+
+        import cv2  # noqa: F401
+        import cupy  # noqa: F401
+        import mediapipe  # noqa: F401
+        import numpy  # noqa: F401
+
+        from zoom_bounce_gpu import create_zoom_bounce_effect
+        self._effect_fn = create_zoom_bounce_effect
+
+    @modal.method()
+    def process(self, input_bytes: bytes, output_filename: str, **kwargs) -> bytes:
+        """Process video bytes and return result bytes."""
+        input_path = f"/tmp/input_{output_filename}"
+        output_path = f"/tmp/{output_filename}"
+
+        with open(input_path, "wb") as f:
+            f.write(input_bytes)
+
+        self._effect_fn(input_path, output_path, **kwargs)
+
+        with open(output_path, "rb") as f:
+            return f.read()
+
+
+# ---------------------------------------------------------------------------
+# Routing helpers
+# ---------------------------------------------------------------------------
+_TIER_TO_CLS = {
+    "standard": ZoomBounceL4,
+    "premium": ZoomBounceL40S,
+}
+
+
+def _get_processor(tier: str):
+    """Return the processor class for a given tier."""
+    return _TIER_TO_CLS[tier]
+
+
+def _route_request(req: ProcessRequest, input_bytes: bytes) -> str:
+    """Determine tier: explicit > auto-route by size > default."""
+    if req.gpu_tier and req.gpu_tier in GPU_TIERS:
+        return req.gpu_tier
+    # Auto-route by size
+    size_mb = len(input_bytes) / 1e6
+    return "premium" if size_mb >= 50 else "standard"
+
+
+def _call_with_fallback(input_bytes: bytes, output_filename: str, tier: str, spawn: bool = False, **kwargs):
+    """Try preferred tier, fall back on failure. Returns (result_or_call, tier_used)."""
+    start_idx = FALLBACK_ORDER.index(tier) if tier in FALLBACK_ORDER else 0
+    tiers_to_try = FALLBACK_ORDER[start_idx:]
+
+    last_exc = None
+    for t in tiers_to_try:
+        try:
+            processor = _get_processor(t)()
+            if spawn:
+                call = processor.process.spawn(
+                    input_bytes=input_bytes,
+                    output_filename=output_filename,
+                    **kwargs,
+                )
+                return call, t
+            else:
+                result = processor.process.remote(
+                    input_bytes=input_bytes,
+                    output_filename=output_filename,
+                    **kwargs,
+                )
+                return result, t
+        except Exception as exc:
+            logger.warning("Tier %s failed: %s — trying next tier", t, exc)
+            last_exc = exc
+            continue
+
+    raise RuntimeError(f"All GPU tiers exhausted. Last error: {last_exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -146,17 +247,22 @@ def process_sync(req: ProcessRequest):
     if error:
         return JSONResponse(status_code=400, content={"error": error})
 
-    processor = ZoomBounceProcessor()
-    result_bytes = processor.process.remote(
+    tier = _route_request(req, input_bytes)
+    result_bytes, tier_used = _call_with_fallback(
         input_bytes=input_bytes,
         output_filename=output_filename,
+        tier=tier,
+        spawn=False,
         **req.kwargs,
     )
 
     return StreamingResponse(
         io.BytesIO(result_bytes),
         media_type="video/mp4",
-        headers={"Content-Disposition": f'attachment; filename="{output_filename}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{output_filename}"',
+            "X-GPU-Tier": tier_used,
+        },
     )
 
 
@@ -172,13 +278,15 @@ def submit_async(req: ProcessRequest) -> JobSubmitResponse:
     if error:
         return JSONResponse(status_code=400, content={"error": error})
 
-    processor = ZoomBounceProcessor()
-    call = processor.process.spawn(
+    tier = _route_request(req, input_bytes)
+    call, tier_used = _call_with_fallback(
         input_bytes=input_bytes,
         output_filename=output_filename,
+        tier=tier,
+        spawn=True,
         **req.kwargs,
     )
-    return JobSubmitResponse(call_id=call.object_id)
+    return JobSubmitResponse(call_id=call.object_id, gpu_tier=tier_used)
 
 
 @app.function(image=image, timeout=60)
@@ -225,10 +333,10 @@ def job_result(call_id: str, filename: str = "output.mp4"):
 # Local entrypoint — run from CLI with local files
 # ---------------------------------------------------------------------------
 @app.local_entrypoint()
-def main(input_file: str, output_file: str = None, debug_labels: bool = True):
+def main(input_file: str, output_file: str = None, debug_labels: bool = True, gpu_tier: str = None):
     """Run a local video file through the deployed prod processor.
 
-    Usage: modal run modal_prod.py --input-file path/to/vid.mp4
+    Usage: modal run modal_prod.py --input-file path/to/vid.mp4 [--gpu-tier premium]
     """
     import os
     import time
@@ -245,17 +353,25 @@ def main(input_file: str, output_file: str = None, debug_labels: bool = True):
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, output_filename)
 
-    print(f"Input:  {input_file} ({os.path.getsize(input_file) / 1e6:.1f} MB)")
-    print(f"Output: {output_path}")
-    print(f"GPU:    {GPU_PROD}")
-
     with open(input_file, "rb") as f:
         input_bytes = f.read()
 
-    processor = ZoomBounceProcessor()
-    result_bytes = processor.process.remote(
+    # Route
+    size_mb = len(input_bytes) / 1e6
+    if gpu_tier and gpu_tier in GPU_TIERS:
+        tier = gpu_tier
+    else:
+        tier = "premium" if size_mb >= 50 else "standard"
+
+    print(f"Input:  {input_file} ({size_mb:.1f} MB)")
+    print(f"Output: {output_path}")
+    print(f"GPU:    {GPU_TIERS[tier]['gpu']} (tier: {tier})")
+
+    result_bytes, tier_used = _call_with_fallback(
         input_bytes=input_bytes,
         output_filename=output_filename,
+        tier=tier,
+        spawn=False,
         debug_labels=debug_labels,
         stabilize=0,
         bounces=[
@@ -266,18 +382,22 @@ def main(input_file: str, output_file: str = None, debug_labels: bool = True):
 
     with open(output_path, "wb") as f:
         f.write(result_bytes)
-    print(f"Done! Saved {output_path}")
+    print(f"Done! Saved {output_path} (processed on {tier_used})")
 
 
 # ---------------------------------------------------------------------------
 # External trigger helper
 # ---------------------------------------------------------------------------
-def get_remote_processor():
+def get_remote_processor(tier: str = DEFAULT_TIER):
     """Get a handle to the deployed processor from any Python env with Modal auth.
+
+    Args:
+        tier: "standard" (L4) or "premium" (L40S). Defaults to standard.
 
     Usage:
         from modal_prod import get_remote_processor
-        processor = get_remote_processor()
+        processor = get_remote_processor("premium")
         result = processor.process.remote(input_bytes=b"...", output_filename="out.mp4")
     """
-    return modal.Cls.from_name("zoom-bounce-prod", "ZoomBounceProcessor")()
+    cls_name = {"standard": "ZoomBounceL4", "premium": "ZoomBounceL40S"}.get(tier, "ZoomBounceL4")
+    return modal.Cls.from_name("zoom-bounce-prod", cls_name)()

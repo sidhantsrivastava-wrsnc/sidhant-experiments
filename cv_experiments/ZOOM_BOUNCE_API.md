@@ -2,7 +2,7 @@
 
 ## Overview
 
-GPU-accelerated video effects processor running on Modal (NVIDIA L40S). Takes a video + a timeline of effects, returns the processed video.
+GPU-accelerated video effects processor running on Modal. Supports two GPU tiers — **standard** (NVIDIA L4) and **premium** (NVIDIA L40S) — with automatic routing based on video size and fallback between tiers.
 
 **Base URL:** `https://writesonic--zoom-bounce-prod-{endpoint}.modal.run`
 
@@ -13,22 +13,33 @@ GPU-accelerated video effects processor running on Modal (NVIDIA L40S). Takes a 
 ## Architecture
 
 ```
-                        ┌─────────────────────────────────────────────┐
-                        │              Modal Cloud                    │
-                        │                                             │
-┌────────┐   POST       │  ┌─────────────┐      ┌──────────────────┐ │
-│        │─────────────>│  │ Web Endpoint │      │ GPU Container    │ │
-│ Caller │   JSON +     │  │ (lightweight)│─────>│ L40S             │ │
-│        │   video URL  │  │              │bytes │                  │ │
-│        │              │  │ Downloads    │      │ zoom_bounce_gpu  │ │
-│        │<─────────────│  │ video from   │<─────│ .py              │ │
-│        │   MP4 stream │  │ URL, returns │bytes │                  │ │
-└────────┘              │  │ result       │      │ cupy + opencv +  │ │
-                        │  └─────────────┘      │ mediapipe +      │ │
-                        │                        │ h264_nvenc       │ │
-                        │                        └──────────────────┘ │
-                        └─────────────────────────────────────────────┘
+                        ┌──────────────────────────────────────────────────┐
+                        │                Modal Cloud                       │
+                        │                                                  │
+┌────────┐   POST       │  ┌─────────────┐      ┌───────────────────────┐ │
+│        │─────────────>│  │ Web Endpoint │      │ GPU Containers        │ │
+│ Caller │   JSON +     │  │ (lightweight)│──┬──>│ L4  (standard tier)   │ │
+│        │   video URL  │  │              │  │   │                       │ │
+│        │              │  │ Downloads    │  │   ├───────────────────────┤ │
+│        │<─────────────│  │ video, routes│  └──>│ L40S (premium tier)   │ │
+│        │   MP4 stream │  │ to GPU tier  │      │                       │ │
+└────────┘              │  └─────────────┘      │ zoom_bounce_gpu.py    │ │
+                        │                        │ cupy + opencv +       │ │
+                        │                        │ mediapipe + h264_nvenc│ │
+                        │                        └───────────────────────┘ │
+                        └──────────────────────────────────────────────────┘
 ```
+
+### GPU Tier Routing
+
+| Tier | GPU | When used |
+|------|-----|-----------|
+| `standard` | NVIDIA L4 | Videos < 50 MB (default) |
+| `premium` | NVIDIA L40S | Videos >= 50 MB, or explicitly requested |
+
+**Routing priority:** explicit `gpu_tier` field > auto-route by video size > default (`standard`).
+
+**Fallback:** If the selected tier fails (capacity/timeout), the system automatically tries the next tier in order: `standard` → `premium`.
 
 ---
 
@@ -44,6 +55,7 @@ curl -X POST https://writesonic--zoom-bounce-prod-process-sync.modal.run \
   -o output.mp4 \
   -d '{
     "input_url": "https://your-s3-presigned-url...",
+    "gpu_tier": "premium",
     "kwargs": {
       "stabilize": 0,
       "debug_labels": false,
@@ -55,7 +67,7 @@ curl -X POST https://writesonic--zoom-bounce-prod-process-sync.modal.run \
   }'
 ```
 
-**Response:** Raw MP4 file stream (save with `-o output.mp4`).
+**Response:** Raw MP4 file stream (save with `-o output.mp4`). The `X-GPU-Tier` response header indicates which tier processed the video.
 
 ---
 
@@ -79,7 +91,7 @@ curl -s -X POST https://writesonic--zoom-bounce-prod-submit-async.modal.run \
 
 **Response:**
 ```json
-{"call_id": "fc-01KJCB98E0D9B0J7K8JZNK7HVH", "status": "submitted"}
+{"call_id": "fc-01KJCB98E0D9B0J7K8JZNK7HVH", "status": "submitted", "gpu_tier": "standard"}
 ```
 
 ---
@@ -120,6 +132,7 @@ curl -o output.mp4 "https://writesonic--zoom-bounce-prod-job-result.modal.run?ca
 | `input_url` | string | One of `input_url` or `input_path` | URL to download video from (presigned S3, public URL, etc.) |
 | `input_path` | string | One of `input_url` or `input_path` | Absolute path inside the container (e.g. `/root/cv_experiments/inputs/vid.mp4`) |
 | `output_filename` | string | No | Output filename. Auto-generated UUID if omitted. |
+| `gpu_tier` | string | No | `"standard"` (L4), `"premium"` (L40S), or omit for auto-routing by video size. |
 | `kwargs` | object | No | Parameters passed to `create_zoom_bounce_effect()`. See below. |
 
 ### kwargs — Effect Parameters
@@ -216,12 +229,27 @@ CALL_ID=$(curl -s -X POST https://writesonic--zoom-bounce-prod-submit-async.moda
 curl -o result.mp4 "https://writesonic--zoom-bounce-prod-job-result.modal.run?call_id=$CALL_ID"
 ```
 
-### Pattern D: From Python (with Modal auth)
+### Pattern D: Explicit GPU tier selection
+
+```bash
+# Force premium tier (L40S) for a large or time-sensitive video
+curl -s -X POST https://writesonic--zoom-bounce-prod-submit-async.modal.run \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input_url": "https://...",
+    "gpu_tier": "premium",
+    "kwargs": {"bounces": [...]}
+  }'
+# Response: {"call_id": "fc-...", "status": "submitted", "gpu_tier": "premium"}
+```
+
+### Pattern E: From Python (with Modal auth)
 
 ```python
 from modal_prod import get_remote_processor
 
-processor = get_remote_processor()
+# Get a specific tier
+processor = get_remote_processor("premium")
 result_bytes = processor.process.remote(
     input_bytes=open("video.mp4", "rb").read(),
     output_filename="processed.mp4",
@@ -233,24 +261,28 @@ result_bytes = processor.process.remote(
 open("processed.mp4", "wb").write(result_bytes)
 ```
 
-### Pattern E: Modal CLI
+### Pattern F: Modal CLI
 
 ```bash
+# Auto-routes based on file size
 modal run modal_prod.py --input-file /path/to/video.mp4
+
+# Explicit tier
+modal run modal_prod.py --input-file /path/to/video.mp4 --gpu-tier premium
 ```
 
 ---
 
 ## Infrastructure
 
-| Setting | Value |
-|---------|-------|
-| GPU | NVIDIA L40S |
-| Timeout | 30 minutes |
-| Retries | 2 (exponential backoff: 5s, 10s) |
-| Scaledown | 5 minutes warm pool |
-| Image | CUDA 12.2 + ffmpeg (NVENC) + cupy + opencv + mediapipe |
-| Auth | None (public endpoints) |
+| Setting | Standard Tier | Premium Tier |
+|---------|---------------|--------------|
+| GPU | NVIDIA L4 | NVIDIA L40S |
+| Timeout | 30 minutes | 30 minutes |
+| Retries | 2 (exponential backoff: 5s, 10s) | 2 (exponential backoff: 5s, 10s) |
+| Scaledown | 2 minutes | 5 minutes warm pool |
+| Image | CUDA 12.2 + ffmpeg (NVENC) + cupy + opencv + mediapipe | Same |
+| Auth | None (public endpoints) | Same |
 
 ### Deploy
 
@@ -258,6 +290,8 @@ modal run modal_prod.py --input-file /path/to/video.mp4
 cd cv_experiments
 modal deploy modal_prod.py
 ```
+
+After deploying, you should see both `ZoomBounceL4.*` and `ZoomBounceL40S.*` functions registered.
 
 ### Dev mode (hot-reload, cheaper GPU)
 
@@ -273,8 +307,9 @@ modal run modal_dev.py --case vid_short_mix  # run a test case
 - **No auth** — endpoints are public. Add bearer token or `modal.web_auth` before exposing to users.
 - **Bytes through scheduler** — video bytes pass through Modal's scheduler (~2x video size). Fine for <200MB videos. For larger, switch to S3 direct I/O.
 - **Presigned URL expiry** — if using S3 presigned URLs, ensure they don't expire before the endpoint downloads the video (allow 2+ min).
-- **Cold start** — first request after scaledown takes ~30-60s (GPU container boot + library imports). Subsequent requests on warm containers are fast.
+- **Cold start** — first request after scaledown takes ~30-60s (GPU container boot + library imports). Subsequent requests on warm containers are fast. Standard tier (L4) has shorter scaledown (2 min) so cold starts are more frequent but cheaper.
 - **stabilize != 0** — falls back to CPU path (much slower). Keep `stabilize: 0` for GPU speed.
+- **Fallback behavior** — if the selected GPU tier fails, the system tries the next tier automatically. This means a "standard" request may end up on L40S if L4 has no capacity.
 
 ---
 

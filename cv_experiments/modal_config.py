@@ -13,6 +13,13 @@ import modal
 GPU_PROD = "L40S"
 GPU_DEV = "L4"
 
+GPU_TIERS = {
+    "standard": {"gpu": "L4",   "timeout": 1800, "scaledown": 120},
+    "premium":  {"gpu": "L40S", "timeout": 1800, "scaledown": 300},
+}
+DEFAULT_TIER = "standard"
+FALLBACK_ORDER = ["standard", "premium"]  # try cheap first, then expensive
+
 # ---------------------------------------------------------------------------
 # Timeouts & scaling
 # ---------------------------------------------------------------------------
