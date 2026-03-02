@@ -88,6 +88,13 @@ class ProcessToS3Request(BaseModel):
     output_s3_key: str = Field(..., description="S3 key where output video will be written via /s3data mount")
     gpu_tier: str | None = Field(None, description='GPU tier: "standard" (L4), "premium" (L40S), or null for auto')
     kwargs: dict[str, Any] = Field(default_factory=dict, description="Extra kwargs for create_zoom_bounce_effect")
+    # Webhook async completion fields (optional — when present, POST result to webhook instead of returning inline)
+    webhook_url: str | None = Field(None, alias="_webhook_url", description="URL to POST completion/failure to")
+    webhook_secret: str | None = Field(None, alias="_webhook_secret", description="HMAC-SHA256 signing secret")
+    task_token: str | None = Field(None, alias="_task_token", description="Base64-encoded Temporal task token")
+    output_s3_uri: str | None = Field(None, alias="_output_s3_uri", description="Full s3:// URI to include in webhook result")
+
+    model_config = {"populate_by_name": True}
 
 
 class ProcessToS3Response(BaseModel):
@@ -192,6 +199,49 @@ class ZoomBounceL40S:
 # ---------------------------------------------------------------------------
 # Routing helpers
 # ---------------------------------------------------------------------------
+def _send_webhook_completion(webhook_url: str, webhook_secret: str, task_token: str, result: dict = None, error: str = None):
+    """Send async completion to backend webhook (replicates lambda handler pattern)."""
+    import hashlib
+    import hmac
+    import json as _json
+    import urllib.request
+
+    payload = {
+        "task_token": task_token,
+        "status": "success" if not error else "failure",
+    }
+    if result is not None:
+        payload["result"] = result
+    if error is not None:
+        payload["error"] = error
+
+    body_bytes = _json.dumps(payload).encode("utf-8")
+    signature = hmac.new(
+        webhook_secret.encode("utf-8"),
+        body_bytes,
+        hashlib.sha256,
+    ).hexdigest()
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-bansi-secret": signature,
+    }
+    req = urllib.request.Request(webhook_url, data=body_bytes, headers=headers, method="POST")
+
+    MAX_RETRIES = 3
+    for attempt in range(MAX_RETRIES):
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                logger.info("Webhook response: %d %s", resp.status, resp.read().decode("utf-8"))
+                return
+        except Exception as e:
+            logger.warning("Webhook attempt %d/%d failed: %s", attempt + 1, MAX_RETRIES, e)
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(1)
+            else:
+                logger.error("Giving up on webhook after %d attempts.", MAX_RETRIES)
+
+
 _TIER_TO_CLS = {
     "standard": ZoomBounceL4,
     "premium": ZoomBounceL40S,
@@ -334,14 +384,26 @@ def process_to_s3(req: ProcessToS3Request) -> ProcessToS3Response:
         tier = "premium" if size_mb >= 50 else "standard"
 
     # Process with S3 output
-    _result_bytes, tier_used = _call_with_fallback(
-        input_bytes=input_bytes,
-        output_filename=output_filename,
-        tier=tier,
-        spawn=False,
-        output_s3_key=req.output_s3_key,
-        **req.kwargs,
-    )
+    has_webhook = req.webhook_url and req.webhook_secret and req.task_token
+
+    try:
+        _result_bytes, tier_used = _call_with_fallback(
+            input_bytes=input_bytes,
+            output_filename=output_filename,
+            tier=tier,
+            spawn=False,
+            output_s3_key=req.output_s3_key,
+            **req.kwargs,
+        )
+    except Exception as e:
+        if has_webhook:
+            _send_webhook_completion(req.webhook_url, req.webhook_secret, req.task_token, error=str(e))
+            return ProcessToS3Response(status="completed", output_s3_key=req.output_s3_key, gpu_tier=None)
+        raise
+
+    if has_webhook:
+        result_payload = {"output_path": req.output_s3_uri or f"s3://unknown/{req.output_s3_key}"}
+        _send_webhook_completion(req.webhook_url, req.webhook_secret, req.task_token, result=result_payload)
 
     return ProcessToS3Response(
         status="completed",

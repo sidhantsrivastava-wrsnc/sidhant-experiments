@@ -1526,6 +1526,12 @@ def _render_active_segment(
     decoder = _ThreadedDecoder(input_path, frame_start, frame_end, w, h, fps)
     writer = open_ffmpeg_writer(output_path, w, h, fps, enc)
 
+    # Zoom-proportional dampening state — reduces tracking jitter when
+    # magnified.  At z=1 the dampen_alpha=1 (no extra smoothing); as z
+    # increases the alpha shrinks so frame-to-frame deltas are suppressed
+    # proportionally to the magnification that would amplify them.
+    damp_fx = damp_fy = None
+
     for idx in range(frame_start, frame_end + 1):
         ok, rgb = decoder.read()
         if not ok:
@@ -1537,6 +1543,7 @@ def _render_active_segment(
 
         # Passthrough within active segment (frame has no actual effect)
         if p < 0.001 and blur_strength[idx] < 0.001 and whip_strength[idx] < 0.001:
+            damp_fx = damp_fy = None  # reset dampen on passthrough
             writer.stdin.write(rgb.data)
             continue
         t = times[idx]
@@ -1551,6 +1558,18 @@ def _render_active_segment(
         else:
             fx, fy = float(fx_raw), float(fy_raw)
         fw, fh = float(fw_raw), float(fh_raw)
+
+        # Zoom-proportional dampen: suppress tracking jitter that zoom amplifies
+        if z > 1.001:
+            dampen_alpha = 1.0 / z  # z=1.4 → alpha≈0.71, heavier smoothing
+            if damp_fx is None:
+                damp_fx, damp_fy = fx, fy
+            else:
+                damp_fx = dampen_alpha * fx + (1.0 - dampen_alpha) * damp_fx
+                damp_fy = dampen_alpha * fy + (1.0 - dampen_alpha) * damp_fy
+            fx, fy = damp_fx, damp_fy
+        else:
+            damp_fx = damp_fy = None
 
         tx = lerp(w / 2, fx, p)
         ty = lerp(h / 2, fy, p)

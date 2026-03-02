@@ -1420,6 +1420,8 @@ def _render_active_segment_nvcodec(
 
     bitstream_file = open(raw_h264_path, "wb")
 
+    damp_fx = damp_fy = None
+
     for idx in range(frame_start, frame_end + 1):
         p = float(p_curve[idx])
         z = float(zooms[idx])
@@ -1433,6 +1435,7 @@ def _render_active_segment_nvcodec(
                 g_frame = cp.transpose(g_frame, (1, 2, 0))
 
         if p < 0.001 and blur_strength[idx] < 0.001 and whip_strength[idx] < 0.001:
+            damp_fx = damp_fy = None
             cp.copyto(pool.rgb, g_frame)
             nv12_full, nv12_y, nv12_uv = pool.get_nv12_buffers()
             _gpu_rgb_to_nv12(pool.rgb, nv12_y, nv12_uv, w, h)
@@ -1455,6 +1458,18 @@ def _render_active_segment_nvcodec(
         else:
             fx, fy = float(fx_raw), float(fy_raw)
         fw, fh = float(fw_raw), float(fh_raw)
+
+        # Zoom-proportional dampen: suppress tracking jitter that zoom amplifies
+        if z > 1.001:
+            dampen_alpha = 1.0 / z
+            if damp_fx is None:
+                damp_fx, damp_fy = fx, fy
+            else:
+                damp_fx = dampen_alpha * fx + (1.0 - dampen_alpha) * damp_fx
+                damp_fy = dampen_alpha * fy + (1.0 - dampen_alpha) * damp_fy
+            fx, fy = damp_fx, damp_fy
+        else:
+            damp_fx = damp_fy = None
 
         tx = lerp(w / 2, fx, p)
         ty = lerp(h / 2, fy, p)
@@ -1646,6 +1661,7 @@ def _render_active_segment_fallback(
     decoder = _ThreadedDecoder(input_path, frame_start, frame_end, w, h, fps)
     writer = open_ffmpeg_writer(output_path, w, h, fps, enc, pix_fmt="nv12")
 
+    damp_fx = damp_fy = None
     _rendered_count = 0
     for idx in range(frame_start, frame_end + 1):
         ok, rgb = decoder.read()
@@ -1658,6 +1674,7 @@ def _render_active_segment_fallback(
         _rendered_count = local + 1
 
         if p < 0.001 and blur_strength[idx] < 0.001 and whip_strength[idx] < 0.001:
+            damp_fx = damp_fy = None
             pool.rgb[:] = cp.asarray(rgb)
             nv12_full, nv12_y, nv12_uv = pool.get_nv12_buffers()
             _gpu_rgb_to_nv12(pool.rgb, nv12_y, nv12_uv, w, h)
@@ -1678,6 +1695,18 @@ def _render_active_segment_fallback(
         else:
             fx, fy = float(fx_raw), float(fy_raw)
         fw, fh = float(fw_raw), float(fh_raw)
+
+        # Zoom-proportional dampen: suppress tracking jitter that zoom amplifies
+        if z > 1.001:
+            dampen_alpha = 1.0 / z
+            if damp_fx is None:
+                damp_fx, damp_fy = fx, fy
+            else:
+                damp_fx = dampen_alpha * fx + (1.0 - dampen_alpha) * damp_fx
+                damp_fy = dampen_alpha * fy + (1.0 - dampen_alpha) * damp_fy
+            fx, fy = damp_fx, damp_fy
+        else:
+            damp_fx = damp_fy = None
 
         tx = lerp(w / 2, fx, p)
         ty = lerp(h / 2, fy, p)
