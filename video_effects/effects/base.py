@@ -49,5 +49,9 @@ class BaseEffect(ABC):
             if cue.start_time <= timestamp <= cue.end_time
         ]
 
+    def get_active_ranges(self) -> list[tuple[float, float]]:
+        """Return time ranges where this effect is active."""
+        return [(cue.start_time, cue.end_time) for cue in self._cues]
+
     def _lerp(self, a: float, b: float, t: float) -> float:
         return a + (b - a) * t

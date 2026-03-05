@@ -21,8 +21,9 @@ class TargetRegion(BaseModel):
 
 class ZoomParams(BaseModel):
     tracking: Literal["face", "center", "point"] = "center"
-    zoom_level: float = Field(1.5, ge=0.1, le=3.0, description="Zoom magnification (< 1.0 zooms out)")
+    zoom_level: float = Field(1.5, ge=1.0, le=3.0, description="Zoom magnification level")
     easing: Literal["smooth", "snap", "overshoot"] = "smooth"
+    action: Literal["bounce", "in", "out"] = "bounce"
 
 
 class BlurParams(BaseModel):

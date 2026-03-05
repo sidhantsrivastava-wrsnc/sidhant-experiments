@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import cv2
 
@@ -12,6 +14,7 @@ class ZoomEffect(BaseEffect):
         super().__init__()
         self._face_data: list[tuple[float, float, float, float]] | None = None
         self._video_info: VideoInfo | None = None
+        self._hold_intervals: list[tuple[float, float, float, str]] = []
 
     def setup(self, video_info: VideoInfo, effect_cues: list[EffectCue]) -> None:
         self._cues = effect_cues
@@ -24,6 +27,41 @@ class ZoomEffect(BaseEffect):
         ]
         if face_cues:
             self._setup_face_tracking(video_info, face_cues)
+
+        self._build_hold_intervals()
+
+    def _build_hold_intervals(self) -> None:
+        """Pair each 'in' cue with the next 'out' cue to create hold intervals."""
+        zoom_cues = [
+            c for c in self._cues
+            if c.zoom_params is not None
+        ]
+        zoom_cues.sort(key=lambda c: c.start_time)
+
+        self._hold_intervals = []
+        pending_in: EffectCue | None = None
+
+        for cue in zoom_cues:
+            action = cue.zoom_params.action
+            if action == "in":
+                pending_in = cue
+            elif action == "out" and pending_in is not None:
+                # Hold between end of "in" and start of "out"
+                if pending_in.end_time < cue.start_time:
+                    self._hold_intervals.append((
+                        pending_in.end_time,
+                        cue.start_time,
+                        pending_in.zoom_params.zoom_level,
+                        pending_in.zoom_params.tracking,
+                    ))
+                pending_in = None
+
+    def get_active_ranges(self) -> list[tuple[float, float]]:
+        """Include hold intervals in active ranges."""
+        ranges = super().get_active_ranges()
+        for hold_start, hold_end, _, _ in self._hold_intervals:
+            ranges.append((hold_start, hold_end))
+        return ranges
 
     def _setup_face_tracking(
         self, video_info: VideoInfo, face_cues: list[EffectCue]
@@ -44,6 +82,21 @@ class ZoomEffect(BaseEffect):
     def apply_frame(
         self, frame: np.ndarray, timestamp: float, context: EffectContext
     ) -> np.ndarray:
+        # Check hold intervals first (constant zoom between in/out pairs)
+        for hold_start, hold_end, hold_zoom, hold_tracking in self._hold_intervals:
+            if hold_start <= timestamp <= hold_end:
+                h, w = frame.shape[:2]
+                if hold_tracking == "center":
+                    tx, ty = w / 2, h / 2
+                else:
+                    tx, ty = w / 2, h / 2
+                sx = w / 2 - tx * hold_zoom
+                sy = h / 2 - ty * hold_zoom
+                M = np.float32([[hold_zoom, 0, sx], [0, hold_zoom, sy]])
+                return cv2.warpAffine(
+                    frame, M, (w, h), borderMode=cv2.BORDER_REPLICATE
+                )
+
         active_cues = self.get_active_cues(timestamp)
         if not active_cues:
             return frame
@@ -62,18 +115,16 @@ class ZoomEffect(BaseEffect):
             duration = cue.end_time - cue.start_time
             if duration > 0:
                 progress = (timestamp - cue.start_time) / duration
-                p = self._ease(progress, params.easing)
             else:
-                p = 1.0
+                progress = 1.0
 
-            # Interpolate zoom: 1.0 -> target -> 1.0
-            # Ramp up in first 15%, hold, ramp down in last 15%
-            if p < 0.15:
-                intensity = p / 0.15
-            elif p > 0.85:
-                intensity = (1.0 - p) / 0.15
-            else:
-                intensity = 1.0
+            action = params.action
+            if action == "in":
+                intensity = self._ease_in(progress, params.easing)
+            elif action == "out":
+                intensity = self._ease_out(progress, params.easing)
+            else:  # bounce
+                intensity = self._ease_bounce(progress, params.easing)
 
             current_zoom = 1.0 + (z - 1.0) * intensity
 
@@ -98,24 +149,45 @@ class ZoomEffect(BaseEffect):
 
         return result
 
-    def _ease(self, t: float, easing: str) -> float:
-        """Apply easing function to progress value."""
+    def _ease_bounce(self, t: float, easing: str) -> float:
+        """Symmetric 0 -> 1 -> 0 easing for bounce action."""
         t = max(0.0, min(1.0, t))
         if easing == "snap":
-            # Quick ease-in, hold, quick ease-out
-            if t < 0.1:
-                return t / 0.1
-            elif t > 0.9:
-                return (1.0 - t) / 0.1
+            if t < 0.25:
+                return (t / 0.25) ** 2
+            elif t > 0.75:
+                r = (t - 0.75) / 0.25
+                return 1.0 - r ** 2
             return 1.0
         elif easing == "overshoot":
-            # Slight overshoot then settle
-            if t < 0.5:
-                s = t * 2
-                return s * s * (2.7 * s - 1.7)
-            return 1.0
+            base = math.sin(math.pi * t)
+            overshoot = 0.15 * math.sin(2.0 * math.pi * t)
+            return max(0.0, min(1.15, base + overshoot))
         else:  # smooth
-            # Smooth ease-in-out (cubic)
+            return math.sin(math.pi * t)
+
+    def _ease_in(self, t: float, easing: str) -> float:
+        """Monotonic 0 -> 1 easing for zoom-in action."""
+        t = max(0.0, min(1.0, t))
+        if easing == "snap":
             if t < 0.5:
-                return 4 * t * t * t
-            return 1 - pow(-2 * t + 2, 3) / 2
+                return (t / 0.5) ** 2
+            return 1.0
+        elif easing == "overshoot":
+            base = math.sin(math.pi / 2 * t)
+            overshoot = 0.15 * math.sin(math.pi * t)
+            return max(0.0, min(1.15, base + overshoot))
+        else:  # smooth
+            return math.sin(math.pi / 2 * t)
+
+    def _ease_out(self, t: float, easing: str) -> float:
+        """Monotonic 1 -> 0 easing for zoom-out action."""
+        t = max(0.0, min(1.0, t))
+        if easing == "snap":
+            return max(0.0, 1.0 - t ** 2)
+        elif easing == "overshoot":
+            base = math.cos(math.pi / 2 * t)
+            undershoot = -0.15 * math.sin(math.pi * t)
+            return max(0.0, min(1.15, base + undershoot))
+        else:  # smooth
+            return math.cos(math.pi / 2 * t)

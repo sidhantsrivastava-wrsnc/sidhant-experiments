@@ -12,8 +12,20 @@ Analyze the transcript and extract every verbal cue that implies a video effect 
   - `"face"` — when the speaker says "zoom on me", "zoom on my face", "look at me"
   - `"center"` — for generic "zoom in", "let's get closer", "look at this"
   - `"point"` — when referring to a specific object (reserved for future use, default to center)
-- **zoom_level**: 1.2 for subtle, 1.5 for normal, 2.0 for dramatic
+- **zoom_level**: 1.2 for subtle, 1.5 for normal, 2.0 for dramatic (must be >= 1.0, no zoom-out past original frame)
 - **easing**: `"smooth"` default, `"snap"` for sudden dramatic emphasis, `"overshoot"` for comedic/energetic
+- **action**: Controls the zoom behavior:
+  - `"bounce"` (default) — quick emphasis, zooms in then back out. Use for short 2-5s emphasis moments.
+  - `"in"` — zooms in and holds at target level. Use to start a sustained close-up.
+  - `"out"` — releases from held zoom back to normal. Must follow a prior "in" action.
+- **Zoom pairing rules**:
+  - Every `"in"` must eventually have a matching `"out"` (or holds until video end)
+  - No double `"in"` without an `"out"` between them
+  - No orphaned `"out"` without a prior `"in"`
+  - Short emphasis (2-5s) → use `"bounce"`
+  - Sustained close-up → use `"in"` ... `"out"` pair
+- **Duration guidelines for in/out**: 0.5-2s each for the transition; the hold gap between them is unlimited
+- **Triggers for zoom out**: "zoom out", "back to normal", "pull back", "wider shot" → action `"out"`
 
 ### Blur
 - Triggered by: "blur", "censor", "hide this", "pixelate", "blur the background", "focus on me"

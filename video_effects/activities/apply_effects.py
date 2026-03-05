@@ -90,9 +90,9 @@ def _build_merged_intervals(processors: list, video_info: VideoInfo) -> list[tup
     fps = video_info.fps
     intervals = []
     for processor in processors:
-        for cue in processor._cues:
-            s = int(cue.start_time * fps)
-            e = math.ceil(cue.end_time * fps) + 1
+        for start_time, end_time in processor.get_active_ranges():
+            s = int(start_time * fps)
+            e = math.ceil(end_time * fps) + 1
             intervals.append((s, e))
 
     if not intervals:
