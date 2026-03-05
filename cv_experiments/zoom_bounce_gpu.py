@@ -1461,7 +1461,7 @@ def _render_active_segment_nvcodec(
 
         # Zoom-proportional dampen: suppress tracking jitter that zoom amplifies
         if z > 1.001:
-            dampen_alpha = 1.0 / z
+            dampen_alpha = 0.03
             if damp_fx is None:
                 damp_fx, damp_fy = fx, fy
             else:
@@ -1476,6 +1476,8 @@ def _render_active_segment_nvcodec(
         dx = lerp(w / 2, dest_x_full, p)
         sx_val = dx - tx * z
         sy_val = h / 2 - ty * z
+        sx_val = max((1.0 - z) * (w - 1), min(0.0, sx_val))
+        sy_val = max((1.0 - z) * (h - 1), min(0.0, sy_val))
 
         sfx = fx * z + sx_val
         sfy = fy * z + sy_val
@@ -1698,7 +1700,7 @@ def _render_active_segment_fallback(
 
         # Zoom-proportional dampen: suppress tracking jitter that zoom amplifies
         if z > 1.001:
-            dampen_alpha = 1.0 / z
+            dampen_alpha = 0.03
             if damp_fx is None:
                 damp_fx, damp_fy = fx, fy
             else:
@@ -1713,6 +1715,8 @@ def _render_active_segment_fallback(
         dx = lerp(w / 2, dest_x_full, p)
         sx_val = dx - tx * z
         sy_val = h / 2 - ty * z
+        sx_val = max((1.0 - z) * (w - 1), min(0.0, sx_val))
+        sy_val = max((1.0 - z) * (h - 1), min(0.0, sy_val))
 
         sfx = fx * z + sx_val
         sfy = fy * z + sy_val
