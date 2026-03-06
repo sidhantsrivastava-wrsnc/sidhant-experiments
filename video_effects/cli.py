@@ -74,6 +74,76 @@ def _print_timeline(timeline: dict) -> None:
     print("=" * 100)
 
 
+def _print_mg_plan(mg_plan: dict) -> None:
+    """Pretty-print the motion graphics plan."""
+    components = mg_plan.get("components", [])
+    palette = mg_plan.get("color_palette", [])
+    reasoning = mg_plan.get("reasoning", "")
+    issues = mg_plan.get("validation_issues", [])
+
+    print("\n" + "=" * 100)
+    print("  MOTION GRAPHICS PLAN")
+    print("=" * 100)
+
+    if not components:
+        print("  No motion graphics components planned.")
+        print("=" * 100)
+        return
+
+    if reasoning:
+        print(f"  Reasoning: {reasoning}")
+        print()
+
+    print(f"  {'#':<4} {'Template':<20} {'Start':>7} {'End':>7}  {'Text / Props'}")
+    print("-" * 100)
+
+    for i, c in enumerate(components, 1):
+        template = c.get("template", "?")
+        props = c.get("props", {})
+        bounds = c.get("bounds", {})
+
+        # Try to find the best display text from props
+        display_text = props.get("text", "")
+        if not display_text and props.get("name"):
+            display_text = props["name"]
+
+        # Show key props compactly
+        prop_parts = []
+        if display_text:
+            prop_parts.append(f'"{display_text}"')
+        style = props.get("style")
+        if style:
+            prop_parts.append(f"style={style}")
+        font_size = props.get("fontSize")
+        if font_size:
+            prop_parts.append(f"size={font_size}")
+        prop_str = ", ".join(prop_parts) if prop_parts else str(props)
+
+        # Times: Remotion format uses startFrame/durationInFrames
+        start_frame = c.get("startFrame", 0)
+        dur_frames = c.get("durationInFrames", 0)
+        # Approximate seconds (assume 30fps if not available)
+        fps = 30
+        start_s = start_frame / fps
+        end_s = (start_frame + dur_frames) / fps
+
+        pos = ""
+        if bounds:
+            bx = bounds.get("x", 0)
+            by = bounds.get("y", 0)
+            pos = f" @({bx:.0%},{by:.0%})"
+
+        print(f"  {i:<4} {template:<20} {start_s:>6.1f}s {end_s:>6.1f}s  {prop_str}{pos}")
+
+    print("-" * 100)
+    print(f"  Total: {len(components)} component(s)  |  Palette: {', '.join(palette) or 'none'}")
+    if issues:
+        print(f"  Validation fixes: {len(issues)}")
+        for issue in issues:
+            print(f"    - {issue}")
+    print("=" * 100)
+
+
 async def run_workflow(args) -> None:
     """Start the workflow and handle interactive approval."""
     client = await get_client()
@@ -149,8 +219,56 @@ async def run_workflow(args) -> None:
                 print(f"  Error: {error}")
             return
 
+    # ── Motion graphics approval (if enabled and not auto-approve) ──
+    if args.motion_graphics and not args.auto_approve:
+        mg_approved = False
+        for mg_attempt in range(5):
+            msg = "Waiting for motion graphics plan..." if mg_attempt == 0 else "Waiting for revised MG plan..."
+            print(f"\n{msg}")
+            prev_mg = mg_plan if mg_attempt > 0 else None
+            mg_plan = None
+            for _ in range(180):  # 3 minutes max (LLM call can be slow)
+                await asyncio.sleep(1)
+                try:
+                    mg_plan = await handle.query("get_mg_plan")
+                    if mg_plan is not None and mg_plan != prev_mg:
+                        break
+                except Exception:
+                    pass
+
+            if mg_plan is None or mg_plan == prev_mg:
+                # Workflow may have already finished (no MG components, or auto-skipped)
+                print("No motion graphics plan to review (may have been skipped).")
+                break
+
+            if not mg_plan.get("components"):
+                print("LLM decided no motion graphics needed for this video.")
+                break
+
+            _print_mg_plan(mg_plan)
+
+            while True:
+                choice = input("\nApprove MG plan? [y/n/json]: ").strip().lower()
+                if choice in ("y", "yes"):
+                    await handle.signal("approve_mg_plan", [True, ""])
+                    print("MG plan approved. Rendering overlay...")
+                    mg_approved = True
+                    break
+                elif choice in ("n", "no"):
+                    feedback = input("Feedback (what to change): ").strip()
+                    await handle.signal("approve_mg_plan", [False, feedback])
+                    print(f"MG plan rejected. Re-planning... (attempt {mg_attempt + 2}/5)")
+                    break
+                elif choice == "json":
+                    print(json.dumps(mg_plan, indent=2))
+                else:
+                    print("Please enter y, n, or json")
+
+            if mg_approved:
+                break
+
     # Wait for completion
-    print("Waiting for workflow completion...")
+    print("\nWaiting for workflow completion...")
     result = await handle.result()
 
     print(f"\nWorkflow completed!")

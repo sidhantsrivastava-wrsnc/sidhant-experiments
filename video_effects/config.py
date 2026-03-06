@@ -18,7 +18,7 @@ class VideoEffectsSettings(BaseSettings):
 
     # Anthropic API for LLM cue parsing
     ANTHROPIC_API_KEY: Optional[str] = None
-    LLM_MODEL: str = "claude-sonnet-4-20250514"
+    LLM_MODEL: str = "claude-sonnet-4-6"
 
     # ElevenLabs for transcription (falls back to local whisper)
     ELEVENLABS_API_KEY: Optional[str] = None

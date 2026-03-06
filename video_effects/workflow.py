@@ -32,6 +32,10 @@ class VideoEffectsWorkflow:
         self._approval_decision: bool | None = None  # None = pending, True = approved, False = rejected
         self._rejection_feedback: str = ""
         self._timeline_data: dict | None = None
+        # Motion graphics approval state
+        self._mg_plan_data: dict | None = None
+        self._mg_approval_decision: bool | None = None
+        self._mg_rejection_feedback: str = ""
 
     @workflow.signal
     async def approve_timeline(self, args: list) -> None:
@@ -42,10 +46,24 @@ class VideoEffectsWorkflow:
         self._approval_decision = args[0]
         self._rejection_feedback = args[1] if len(args) > 1 else ""
 
+    @workflow.signal
+    async def approve_mg_plan(self, args: list) -> None:
+        """Signal from CLI to approve or reject the motion graphics plan.
+
+        Args is [approved: bool, feedback: str].
+        """
+        self._mg_approval_decision = args[0]
+        self._mg_rejection_feedback = args[1] if len(args) > 1 else ""
+
     @workflow.query
     def get_timeline(self) -> dict | None:
         """Query to get the current timeline for CLI display."""
         return self._timeline_data
+
+    @workflow.query
+    def get_mg_plan(self) -> dict | None:
+        """Query to get the current motion graphics plan for CLI display."""
+        return self._mg_plan_data
 
     @workflow.run
     async def run(self, input: VideoEffectsInput) -> VideoEffectsOutput:
@@ -215,6 +233,7 @@ class VideoEffectsWorkflow:
                 effects=effects,
                 style_hint=input.motion_graphics_style,
                 temp_dir=temp_dir,
+                auto_approve=input.auto_approve,
                 activity_timeout=activity_timeout,
                 long_timeout=long_timeout,
             )
@@ -238,6 +257,7 @@ class VideoEffectsWorkflow:
         effects: list,
         style_hint: str,
         temp_dir: str,
+        auto_approve: bool,
         activity_timeout: timedelta,
         long_timeout: timedelta,
     ) -> int:
@@ -265,25 +285,73 @@ class VideoEffectsWorkflow:
             start_to_close_timeout=activity_timeout,
         )
 
-        # ── G8b: LLM plan motion graphics ──
-        plan_result = await workflow.execute_activity(
-            "vfx_plan_motion_graphics",
-            {
+        # ── G8b: LLM plan motion graphics (with approval loop) ──
+        mg_feedback = ""
+        plan = {}
+        for attempt in range(MAX_RETRIES):
+            plan_input = {
                 "spatial_context": spatial_context,
                 "style_hint": style_hint,
                 "video_fps": fps,
-            },
-            start_to_close_timeout=activity_timeout,
-        )
+            }
+            if mg_feedback:
+                plan_input["feedback"] = mg_feedback
 
-        plan = plan_result.get("composition_plan", {})
-        if not plan.get("components"):
-            workflow.logger.info("LLM produced no motion graphics components, skipping")
+            plan_result = await workflow.execute_activity(
+                "vfx_plan_motion_graphics",
+                plan_input,
+                start_to_close_timeout=activity_timeout,
+            )
+
+            plan = plan_result.get("composition_plan", {})
+            issues = plan_result.get("validation_issues", [])
+
+            # Expose plan for CLI query
+            self._mg_plan_data = {
+                "components": plan.get("components", []),
+                "color_palette": plan.get("colorPalette", []),
+                "reasoning": plan_result.get("raw_plan", {}).get("reasoning", ""),
+                "validation_issues": issues,
+            }
+
+            if not plan.get("components"):
+                workflow.logger.info("LLM produced no motion graphics components, skipping")
+                return 0
+
+            if issues:
+                workflow.logger.info("MG validation issues: %s", issues)
+
+            if auto_approve:
+                break
+
+            # Wait for CLI approval
+            self._mg_approval_decision = None
+            self._mg_rejection_feedback = ""
+
+            try:
+                await workflow.wait_condition(
+                    lambda: self._mg_approval_decision is not None,
+                    timeout=timedelta(minutes=10),
+                )
+            except asyncio.TimeoutError:
+                workflow.logger.warning("MG plan approval timed out, proceeding with current plan")
+                break
+
+            if self._mg_approval_decision:
+                break  # Approved
+
+            # Rejected — loop with feedback
+            mg_feedback = self._mg_rejection_feedback or "User rejected the motion graphics plan. Try different choices."
+            workflow.logger.info(
+                "MG plan rejected (attempt %d/%d): %s", attempt + 1, MAX_RETRIES, mg_feedback
+            )
+            self._mg_plan_data = None  # Clear so CLI can detect new plan
+        else:
+            workflow.logger.warning("MG plan rejected %d times, skipping motion graphics", MAX_RETRIES)
             return 0
 
-        issues = plan_result.get("validation_issues", [])
-        if issues:
-            workflow.logger.info("MG validation issues: %s", issues)
+        if not plan.get("components"):
+            return 0
 
         # ── G8e: Render transparent overlay ──
         overlay_result = await workflow.execute_activity(
