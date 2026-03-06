@@ -31,5 +31,9 @@ class VideoEffectsSettings(BaseSettings):
     FACE_DETECTION_STRIDE: int = 3
     SMOOTHING_ALPHA: float = 0.1
 
+    # Remotion motion graphics
+    REMOTION_DIR: Optional[str] = None  # Override path to remotion/ project (default: auto-detected)
+    REMOTION_CONCURRENCY: Optional[int] = None  # Remotion render concurrency (default: Remotion auto)
+
 
 settings = VideoEffectsSettings()

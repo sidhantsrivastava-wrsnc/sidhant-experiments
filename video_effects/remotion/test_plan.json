@@ -1,0 +1,34 @@
+{
+  "components": [
+    {
+      "template": "animated_title",
+      "startFrame": 0,
+      "durationInFrames": 90,
+      "props": {
+        "text": "Hello Motion Graphics!",
+        "style": "fade",
+        "fontSize": 72,
+        "color": "#FFFFFF",
+        "fontWeight": "700"
+      },
+      "bounds": { "x": 0.05, "y": 0.1, "w": 0.5, "h": 0.1 },
+      "zIndex": 1
+    },
+    {
+      "template": "animated_title",
+      "startFrame": 30,
+      "durationInFrames": 60,
+      "props": {
+        "text": "Slide In Demo",
+        "style": "slide-in",
+        "fontSize": 48,
+        "color": "#FFD700",
+        "fontWeight": "600"
+      },
+      "bounds": { "x": 0.05, "y": 0.8, "w": 0.4, "h": 0.08 },
+      "zIndex": 2
+    }
+  ],
+  "colorPalette": ["#FFFFFF", "#FFD700"],
+  "includeBaseVideo": false
+}

@@ -48,9 +48,10 @@ def call_structured(
 
     # Build tool definition from Pydantic schema
     schema = response_model.model_json_schema()
+    tool_name = "structured_output"
     tool = {
-        "name": "parse_effects",
-        "description": "Parse video effect cues from transcript",
+        "name": tool_name,
+        "description": f"Return structured {response_model.__name__} response",
         "input_schema": schema,
     }
 
@@ -60,7 +61,7 @@ def call_structured(
         system=system_prompt,
         messages=[{"role": "user", "content": user_message}],
         tools=[tool],
-        tool_choice={"type": "tool", "name": "parse_effects"},
+        tool_choice={"type": "tool", "name": tool_name},
     )
 
     # Extract tool use result

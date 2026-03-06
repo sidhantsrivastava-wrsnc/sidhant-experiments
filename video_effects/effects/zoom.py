@@ -1,4 +1,6 @@
+import json
 import math
+import os
 
 import numpy as np
 import cv2
@@ -16,7 +18,8 @@ class ZoomEffect(BaseEffect):
         self._video_info: VideoInfo | None = None
         self._hold_intervals: list[tuple[float, float, float, str]] = []
 
-    def setup(self, video_info: VideoInfo, effect_cues: list[EffectCue]) -> None:
+    def setup(self, video_info: VideoInfo, effect_cues: list[EffectCue],
+              *, cache_dir: str | None = None, video_path: str | None = None) -> None:
         self._cues = effect_cues
         self._video_info = video_info
 
@@ -26,8 +29,13 @@ class ZoomEffect(BaseEffect):
             if c.zoom_params and c.zoom_params.tracking == "face"
         ]
         if face_cues:
-            self._setup_face_tracking(video_info, face_cues)
+            self._setup_face_tracking(video_info, face_cues,
+                                      cache_dir=cache_dir, video_path=video_path)
 
+        self._build_hold_intervals()
+
+    def set_cues(self, effect_cues: list[EffectCue]) -> None:
+        super().set_cues(effect_cues)
         self._build_hold_intervals()
 
     def _build_hold_intervals(self) -> None:
@@ -64,10 +72,24 @@ class ZoomEffect(BaseEffect):
         return ranges
 
     def _setup_face_tracking(
-        self, video_info: VideoInfo, face_cues: list[EffectCue]
+        self, video_info: VideoInfo, face_cues: list[EffectCue],
+        *, cache_dir: str | None = None, video_path: str | None = None,
     ) -> None:
-        """Run face detection on active ranges."""
-        from video_effects.helpers.face_tracking import detect_faces
+        """Run face detection on active ranges, with optional disk cache."""
+        cache_file = os.path.join(cache_dir, "face_tracking_zoom.json") if cache_dir else None
+
+        # Try loading from cache first
+        if cache_file and os.path.exists(cache_file):
+            with open(cache_file) as f:
+                raw = json.load(f)
+            self._face_data = [tuple(row) for row in raw]
+            return
+
+        if video_path is None:
+            self._face_data = None
+            return
+
+        from video_effects.helpers.face_tracking import detect_faces, smooth_data
 
         active_ranges = [
             (
@@ -76,8 +98,18 @@ class ZoomEffect(BaseEffect):
             )
             for c in face_cues
         ]
-        # face_data will be populated by the helper
-        self._face_data = None  # Will be set when we have video path access
+
+        raw_data = detect_faces(
+            video_path, active_ranges, video_info.total_frames
+        )
+        smoothed = smooth_data(raw_data)
+        self._face_data = [tuple(row) for row in smoothed.tolist()]
+
+        # Write cache if cache_dir provided
+        if cache_file:
+            os.makedirs(cache_dir, exist_ok=True)
+            with open(cache_file, "w") as f:
+                json.dump(self._face_data, f)
 
     def apply_frame(
         self, frame: np.ndarray, timestamp: float, context: EffectContext

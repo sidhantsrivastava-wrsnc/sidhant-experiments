@@ -11,7 +11,7 @@ A Temporal-based video effects pipeline that analyzes spoken content in videos, 
 | CLI | `cli.py` | Interactive entry point — launches workflow, polls for approval |
 | Temporal Worker | `worker.py` | Hosts workflow + activities in a thread-pool executor |
 | Workflow Orchestrator | `workflow.py` | 7-group activity pipeline with signal/query approval gate |
-| Activities (7) | `activities/` | Discrete units of work: probe, extract, transcribe, parse, validate, apply, compose |
+| Activities (9) | `activities/` | Discrete units of work: probe, extract, transcribe, parse, validate, prepare/setup/render, compose |
 | Effect Processors (4) | `effects/` | Phase-ordered frame-level processors: Color, Blur, Zoom, Subtitle |
 | LLM Integration | `helpers/llm.py` | Anthropic Claude API wrapper with structured tool-use output |
 | Configuration | `config.py` | Pydantic-settings with `VFX_` env prefix |
@@ -43,7 +43,13 @@ G2: Transcribe Audio (ElevenLabs / Whisper)
 └─────────────────────────────────────┘
   │
   ▼
-G6: Apply Effects (single-pass decode → process → encode)
+G6a: Prepare Render Plan (probe, intervals)
+  │
+  ▼
+G6b: Setup Processors (face tracking → cache)
+  │
+  ▼
+G6c: Render Video (decode → process → encode)
   │
   ▼
 G7: Compose Final (mux original audio)
@@ -63,7 +69,9 @@ Output video
 | **G3** | `vfx_parse_effect_cues` | 10 min | Claude via structured tool-use |
 | **G4** | `vfx_validate_timeline` | 10 min | Clamp, dedupe, sort |
 | **G5** | Signal wait | 10 min | `approve_timeline` signal / `get_timeline` query |
-| **G6** | `vfx_apply_effects` | 30 min | 2-min heartbeat interval |
+| **G6a** | `vfx_prepare_render` | 10 min | Probe dimensions, build active intervals |
+| **G6b** | `vfx_setup_processors` | 10 min | Face tracking, cache writes; 5-min heartbeat |
+| **G6c** | `vfx_render_video` | 30 min | Frame pipeline; 2-min heartbeat |
 | **G7** | `vfx_compose_final` | 10 min | Stream-copy or AAC fallback |
 
 ### Signal / Query Mechanism
@@ -110,9 +118,17 @@ Pipeline:
 4. Resolve same-type overlapping conflicts (keep highest confidence)
 5. Sort by phase order then start time
 
-### G6: `vfx_apply_effects` (`activities/apply_effects.py`)
+### G6a: `vfx_prepare_render` (`activities/apply_effects.py`)
 
-Single-pass frame processing pipeline — see [Frame Processing Pipeline](#frame-processing-pipeline) below.
+Probes decoded dimensions, detects HDR, groups effects by phase, does lightweight processor setup for interval calculation, and builds merged active intervals. Returns a serializable render plan dict.
+
+### G6b: `vfx_setup_processors` (`activities/apply_effects.py`)
+
+Instantiates all effect processors with full setup (including face tracking). Writes expensive pre-computed data (e.g., face tracking positions) to JSON files in `cache_dir`. Subsequent re-creation of processors in G6c loads from cache instead of re-computing.
+
+### G6c: `vfx_render_video` (`activities/apply_effects.py`)
+
+Re-creates processors (loading cached setup data from G6b), uses pre-computed dimensions and active intervals from the G6a render plan, and runs the single-pass decode→process→encode frame pipeline.
 
 ### G7: `vfx_compose_final` (`activities/compose.py`)
 
@@ -127,7 +143,8 @@ Muxes processed video with the preserved original audio:
 
 ```python
 class BaseEffect(ABC):
-    def setup(self, video_info: VideoInfo, effect_cues: list[EffectCue]) -> None: ...
+    def setup(self, video_info: VideoInfo, effect_cues: list[EffectCue],
+              *, cache_dir: str | None = None, video_path: str | None = None) -> None: ...
     def apply_frame(self, frame: np.ndarray, timestamp: float, context: EffectContext) -> np.ndarray: ...
     def is_active(self, timestamp: float) -> bool: ...
     def get_active_cues(self, timestamp: float) -> list[EffectCue]: ...
@@ -296,7 +313,7 @@ Before the frame loop, all effect cue time ranges are merged into a sorted list 
 | `activities/transcribe.py` | `transcribe_audio` (G2) |
 | `activities/parse_cues.py` | `parse_effect_cues` (G3) |
 | `activities/validate.py` | `validate_timeline` (G4) |
-| `activities/apply_effects.py` | `apply_effects` (G6) — frame pipeline |
+| `activities/apply_effects.py` | `prepare_render` (G6a), `setup_processors` (G6b), `render_video` (G6c) — frame pipeline |
 | `activities/compose.py` | `compose_final` (G7) |
 | `effects/__init__.py` | Effect re-exports |
 | `effects/base.py` | `BaseEffect` ABC, `EffectContext` dataclass |

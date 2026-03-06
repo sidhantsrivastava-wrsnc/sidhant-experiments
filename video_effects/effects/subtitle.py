@@ -31,7 +31,8 @@ class SubtitleEffect(BaseEffect):
         super().__init__()
         self._video_info: VideoInfo | None = None
 
-    def setup(self, video_info: VideoInfo, effect_cues: list[EffectCue]) -> None:
+    def setup(self, video_info: VideoInfo, effect_cues: list[EffectCue],
+              *, cache_dir: str | None = None, video_path: str | None = None) -> None:
         self._cues = effect_cues
         self._video_info = video_info
 

@@ -193,13 +193,19 @@ def _process_single_pass(
     processors: list,
     video_info: VideoInfo,
     active_intervals: list[tuple[int, int]],
+    *,
+    decoded_width: int | None = None,
+    decoded_height: int | None = None,
 ) -> None:
     """Decode all frames, apply effects in phase order, encode to H.264.
 
     Uses ffmpeg pipe for both decode and encode with rgb24 as the intermediate
     format, matching the proven color-correct pipeline from zoom_bounce.py.
     """
-    w, h = _probe_decoded_size(input_path)
+    if decoded_width and decoded_height:
+        w, h = decoded_width, decoded_height
+    else:
+        w, h = _probe_decoded_size(input_path)
     total_frames = video_info.total_frames
     is_hdr = _is_hdr(video_info)
 
@@ -294,3 +300,141 @@ def _process_single_pass(
 
     elapsed = time.time() - start_time
     print(f"[vfx]   single-pass done: {total_frames} frames in {elapsed:.1f}s")
+
+
+# ── G6a: Prepare render plan ──
+
+
+@activity.defn(name="vfx_prepare_render")
+def prepare_render(input_data: dict) -> dict:
+    """Probe dimensions, detect HDR, build merged active intervals."""
+    video_path = input_data["video_path"]
+    effects = [EffectCue(**e) for e in input_data["effects"]]
+    video_info = VideoInfo(**input_data["video_info"])
+
+    if not effects:
+        return {
+            "decoded_width": 0, "decoded_height": 0, "is_hdr": False,
+            "phase_summary": [], "active_intervals": [],
+            "active_frame_count": 0, "total_phases": 0, "has_effects": False,
+        }
+
+    decoded_width, decoded_height = _probe_decoded_size(video_path)
+    hdr = _is_hdr(video_info)
+
+    phase_groups = group_by_phase(effects)
+    phase_summary = []
+
+    # Lightweight cue assignment (no expensive setup) just for interval calculation
+    processors = []
+    for phase_num, phase_effects in sorted(phase_groups.items()):
+        effect_type = phase_effects[0].effect_type
+        processor_cls = EFFECT_PROCESSORS.get(effect_type)
+        if processor_cls is None:
+            continue
+        processor = processor_cls()
+        processor.set_cues(phase_effects)
+        processors.append(processor)
+        phase_summary.append({
+            "phase": phase_num,
+            "effect_type": effect_type.value,
+            "count": len(phase_effects),
+        })
+
+    active_intervals = _build_merged_intervals(processors, video_info)
+    active_frame_count = sum(e - s for s, e in active_intervals)
+
+    print(f"[vfx_prepare_render] {len(processors)} phases, "
+          f"resolution: {decoded_width}x{decoded_height}, "
+          f"active frames: {active_frame_count}/{video_info.total_frames}")
+
+    return {
+        "decoded_width": decoded_width,
+        "decoded_height": decoded_height,
+        "is_hdr": hdr,
+        "phase_summary": phase_summary,
+        "active_intervals": active_intervals,
+        "active_frame_count": active_frame_count,
+        "total_phases": len(processors),
+        "has_effects": len(processors) > 0,
+    }
+
+
+# ── G6b: Setup processors (face tracking etc.) ──
+
+
+@activity.defn(name="vfx_setup_processors")
+def setup_processors(input_data: dict) -> dict:
+    """Initialize all effect processors with full setup (face tracking etc.)."""
+    video_path = input_data["video_path"]
+    effects = [EffectCue(**e) for e in input_data["effects"]]
+    video_info = VideoInfo(**input_data["video_info"])
+    cache_dir = input_data["cache_dir"]
+
+    os.makedirs(cache_dir, exist_ok=True)
+
+    phase_groups = group_by_phase(effects)
+    setup_summary = []
+
+    for phase_num, phase_effects in sorted(phase_groups.items()):
+        effect_type = phase_effects[0].effect_type
+        processor_cls = EFFECT_PROCESSORS.get(effect_type)
+        if processor_cls is None:
+            print(f"[vfx_setup_processors] No processor for {effect_type}, skipping")
+            continue
+
+        processor = processor_cls()
+        processor.setup(video_info, phase_effects,
+                        cache_dir=cache_dir, video_path=video_path)
+        setup_summary.append({
+            "phase": phase_num,
+            "effect_type": effect_type.value,
+        })
+        print(f"[vfx_setup_processors] Phase {phase_num} ({effect_type.value}) setup complete")
+        activity.heartbeat(f"setup phase {phase_num}")
+
+    return {"setup_summary": setup_summary, "processors_ready": True}
+
+
+# ── G6c: Render video ──
+
+
+@activity.defn(name="vfx_render_video")
+def render_video(input_data: dict) -> dict:
+    """Re-create processors (loading cached data) and run frame pipeline."""
+    video_path = input_data["video_path"]
+    output_dir = input_data["output_dir"]
+    effects = [EffectCue(**e) for e in input_data["effects"]]
+    video_info = VideoInfo(**input_data["video_info"])
+    render_plan = input_data["render_plan"]
+    cache_dir = input_data["cache_dir"]
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    phase_groups = group_by_phase(effects)
+    processors = []
+    for phase_num, phase_effects in sorted(phase_groups.items()):
+        effect_type = phase_effects[0].effect_type
+        processor_cls = EFFECT_PROCESSORS.get(effect_type)
+        if processor_cls is None:
+            continue
+        processor = processor_cls()
+        # Loads from cache (fast) since G6b already wrote it
+        processor.setup(video_info, phase_effects,
+                        cache_dir=cache_dir, video_path=video_path)
+        processors.append(processor)
+
+    if not processors:
+        return {"processed_video": video_path, "phases_executed": 0}
+
+    active_intervals = [tuple(iv) for iv in render_plan["active_intervals"]]
+    output_path = os.path.join(output_dir, "processed.mp4")
+
+    _process_single_pass(
+        video_path, output_path, processors, video_info, active_intervals,
+        decoded_width=render_plan["decoded_width"],
+        decoded_height=render_plan["decoded_height"],
+    )
+
+    print(f"[vfx_render_video] All {len(processors)} phases complete")
+    return {"processed_video": output_path, "phases_executed": len(processors)}

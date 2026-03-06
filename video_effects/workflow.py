@@ -1,13 +1,17 @@
 """Temporal workflow: VideoEffectsWorkflow.
 
-Pipeline (7 groups):
+Pipeline (7+2 groups, G6 split into 3 sub-activities):
   G1: Extract video info + audio
   G2: Transcribe audio
   G3: LLM: parse effect cues from transcript  ─┐
   G4: Validate timeline + resolve conflicts     │ loops on rejection
   G5: CLI approval                             ─┘
-  G6: Execute effects in dependency order
+  G6a: Prepare render plan (probe, intervals)
+  G6b: Setup processors (face tracking, cache)
+  G6c: Render video (decode → process → encode)
   G7: Final composition + audio mux
+  G8e: Render Remotion motion graphics overlay   (if enable_motion_graphics)
+  G9:  FFmpeg composite overlay onto base        (if enable_motion_graphics)
 """
 
 import asyncio
@@ -147,14 +151,39 @@ class VideoEffectsWorkflow:
                 transcript_length=len(transcript_result["transcript"]),
             )
 
-        # ── G6: Execute effects in phase order ──
-        apply_result = await workflow.execute_activity(
-            "vfx_apply_effects",
+        # ── G6a: Prepare render plan ──
+        render_plan = await workflow.execute_activity(
+            "vfx_prepare_render",
+            {"video_path": video_path, "effects": effects, "video_info": video_info},
+            start_to_close_timeout=activity_timeout,
+        )
+
+        if not render_plan.get("has_effects"):
+            return VideoEffectsOutput(
+                output_video=video_path,
+                effects_applied=len(effects),
+                transcript_length=len(transcript_result["transcript"]),
+                phases_executed=0,
+            )
+
+        # ── G6b: Setup processors (face tracking, etc.) ──
+        setup_result = await workflow.execute_activity(
+            "vfx_setup_processors",
             {
-                "video_path": video_path,
-                "output_dir": temp_dir,
-                "effects": effects,
-                "video_info": video_info,
+                "video_path": video_path, "effects": effects,
+                "video_info": video_info, "cache_dir": temp_dir,
+            },
+            start_to_close_timeout=activity_timeout,
+            heartbeat_timeout=timedelta(minutes=5),
+        )
+
+        # ── G6c: Render video frames ──
+        apply_result = await workflow.execute_activity(
+            "vfx_render_video",
+            {
+                "video_path": video_path, "output_dir": temp_dir,
+                "effects": effects, "video_info": video_info,
+                "render_plan": render_plan, "cache_dir": temp_dir,
             },
             start_to_close_timeout=long_timeout,
             heartbeat_timeout=timedelta(minutes=2),
@@ -172,9 +201,121 @@ class VideoEffectsWorkflow:
             start_to_close_timeout=activity_timeout,
         )
 
+        base_output = compose_result["output_video"]
+        mg_applied = 0
+
+        # ── G8a-G8e + G9: Motion graphics overlay (optional) ──
+        if input.enable_motion_graphics:
+            mg_applied = await self._run_motion_graphics(
+                base_video=base_output,
+                output_path=output_path,
+                video_info=video_info,
+                transcript=transcript_result["transcript"],
+                segments=transcript_result["segments"],
+                effects=effects,
+                style_hint=input.motion_graphics_style,
+                temp_dir=temp_dir,
+                activity_timeout=activity_timeout,
+                long_timeout=long_timeout,
+            )
+
         return VideoEffectsOutput(
-            output_video=compose_result["output_video"],
+            output_video=base_output,
             effects_applied=len(effects),
             transcript_length=len(transcript_result["transcript"]),
             phases_executed=apply_result["phases_executed"],
+            motion_graphics_applied=mg_applied,
         )
+
+    async def _run_motion_graphics(
+        self,
+        *,
+        base_video: str,
+        output_path: str,
+        video_info: dict,
+        transcript: str,
+        segments: list,
+        effects: list,
+        style_hint: str,
+        temp_dir: str,
+        activity_timeout: timedelta,
+        long_timeout: timedelta,
+    ) -> int:
+        """Run G8a-G8e + G9: plan, render, and composite motion graphics.
+
+        Returns number of components rendered (0 if skipped).
+        """
+        mg_dir = f"{temp_dir}/remotion"
+
+        width = video_info.get("width", 1920)
+        height = video_info.get("height", 1080)
+        fps = int(video_info.get("fps", 30))
+        total_frames = video_info.get("total_frames", 0) or int(video_info.get("duration", 10) * fps)
+
+        # ── G8a: Build Remotion context ──
+        spatial_context = await workflow.execute_activity(
+            "vfx_build_remotion_context",
+            {
+                "video_info": video_info,
+                "transcript": transcript,
+                "segments": segments,
+                "effects": effects,
+                "cache_dir": temp_dir,
+            },
+            start_to_close_timeout=activity_timeout,
+        )
+
+        # ── G8b: LLM plan motion graphics ──
+        plan_result = await workflow.execute_activity(
+            "vfx_plan_motion_graphics",
+            {
+                "spatial_context": spatial_context,
+                "style_hint": style_hint,
+                "video_fps": fps,
+            },
+            start_to_close_timeout=activity_timeout,
+        )
+
+        plan = plan_result.get("composition_plan", {})
+        if not plan.get("components"):
+            workflow.logger.info("LLM produced no motion graphics components, skipping")
+            return 0
+
+        issues = plan_result.get("validation_issues", [])
+        if issues:
+            workflow.logger.info("MG validation issues: %s", issues)
+
+        # ── G8e: Render transparent overlay ──
+        overlay_result = await workflow.execute_activity(
+            "vfx_render_motion_overlay",
+            {
+                "composition_plan": plan,
+                "output_dir": f"{mg_dir}/output",
+                "video_width": width,
+                "video_height": height,
+                "video_fps": fps,
+                "total_frames": total_frames,
+            },
+            start_to_close_timeout=long_timeout,
+            heartbeat_timeout=timedelta(minutes=5),
+        )
+
+        overlay_path = overlay_result.get("overlay_path", "")
+        if not overlay_path:
+            return 0
+
+        # ── G9: Composite overlay onto base video ──
+        # Activity writes to temp path then renames to output_path
+        # (FFmpeg can't overwrite its own input)
+        await workflow.execute_activity(
+            "vfx_composite_motion_graphics",
+            {
+                "base_video": base_video,
+                "overlay_video": overlay_path,
+                "output_path": output_path,
+                "temp_dir": temp_dir,
+            },
+            start_to_close_timeout=activity_timeout,
+        )
+
+        return overlay_result.get("components_rendered", 0)

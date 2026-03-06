@@ -22,10 +22,15 @@ class BaseEffect(ABC):
         self._cues: list[EffectCue] = []
 
     @abstractmethod
-    def setup(self, video_info: VideoInfo, effect_cues: list[EffectCue]) -> None:
+    def setup(self, video_info: VideoInfo, effect_cues: list[EffectCue],
+              *, cache_dir: str | None = None, video_path: str | None = None) -> None:
         """Pre-compute any data needed (face tracking, masks, etc.).
 
         Called once per phase before frame iteration begins.
+
+        Args:
+            cache_dir: If set, write/read expensive pre-computed data here.
+            video_path: Path to source video (needed for face tracking etc.).
         """
         ...
 
@@ -35,6 +40,14 @@ class BaseEffect(ABC):
     ) -> np.ndarray:
         """Apply this effect to a single frame. Returns modified frame."""
         ...
+
+    def set_cues(self, effect_cues: list[EffectCue]) -> None:
+        """Assign cues without running expensive setup.
+
+        Sufficient for get_active_ranges() / interval calculation.
+        Subclasses may override to compute derived cue data (e.g. hold intervals).
+        """
+        self._cues = effect_cues
 
     def is_active(self, timestamp: float) -> bool:
         """Check if any cue is active at this timestamp."""

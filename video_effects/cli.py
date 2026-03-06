@@ -83,6 +83,7 @@ async def run_workflow(args) -> None:
         input_video=os.path.abspath(args.input),
         output_video=os.path.abspath(args.output),
         auto_approve=args.auto_approve,
+        enable_motion_graphics=args.motion_graphics,
     )
 
     print(f"Starting Video Effects workflow: {workflow_id}")
@@ -157,12 +158,17 @@ async def run_workflow(args) -> None:
         print(f"  Output: {result.get('output_video', 'N/A')}")
         print(f"  Effects applied: {result.get('effects_applied', 'N/A')}")
         print(f"  Phases executed: {result.get('phases_executed', 'N/A')}")
+        mg = result.get("motion_graphics_applied", 0)
+        if mg:
+            print(f"  Motion graphics: {mg} components")
         if result.get("error"):
             print(f"  Error: {result['error']}")
     else:
         print(f"  Output: {result.output_video}")
         print(f"  Effects applied: {result.effects_applied}")
         print(f"  Phases executed: {result.phases_executed}")
+        if result.motion_graphics_applied:
+            print(f"  Motion graphics: {result.motion_graphics_applied} components")
         if result.error:
             print(f"  Error: {result.error}")
 
@@ -185,6 +191,11 @@ def main():
         "--auto-approve",
         action="store_true",
         help="Skip interactive approval",
+    )
+    run_parser.add_argument(
+        "--motion-graphics", "--mg",
+        action="store_true",
+        help="Enable Remotion motion graphics overlay",
     )
 
     args = parser.parse_args()
