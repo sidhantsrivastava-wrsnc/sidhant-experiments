@@ -1,7 +1,5 @@
 """Pydantic schema for LLM structured output (motion graphics planning)."""
 
-from typing import Literal
-
 from pydantic import BaseModel, Field
 
 
@@ -15,10 +13,7 @@ class MGComponentBounds(BaseModel):
 
 class MGComponentSpec(BaseModel):
     """A single motion graphics component in the LLM plan."""
-    template: Literal[
-        "animated_title", "lower_third", "zoom_callout",
-        "transition_wipe", "keyword_highlight", "progress_bar",
-    ] = Field(description="Which template to use")
+    template: str = Field(description="Which template to use")
     start_time: float = Field(description="Start time in seconds")
     end_time: float = Field(description="End time in seconds")
     props: dict = Field(default_factory=dict, description="Template-specific properties")

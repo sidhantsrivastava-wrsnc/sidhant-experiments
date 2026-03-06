@@ -1,16 +1,6 @@
-from enum import Enum
-from typing import Literal, Optional
+from typing import Optional
 
 from pydantic import BaseModel, Field
-
-
-class MGTemplate(str, Enum):
-    ANIMATED_TITLE = "animated_title"
-    LOWER_THIRD = "lower_third"
-    ZOOM_CALLOUT = "zoom_callout"
-    TRANSITION_WIPE = "transition_wipe"
-    KEYWORD_HIGHLIGHT = "keyword_highlight"
-    PROGRESS_BAR = "progress_bar"
 
 
 class NormalizedRect(BaseModel):
@@ -41,10 +31,7 @@ class SpatialContext(BaseModel):
 
 class MotionGraphicsComponent(BaseModel):
     """A single motion graphics element in the plan."""
-    template: Literal[
-        "animated_title", "lower_third", "zoom_callout",
-        "transition_wipe", "keyword_highlight", "progress_bar",
-    ]
+    template: str
     start_time: float
     end_time: float
     props: dict = Field(default_factory=dict)

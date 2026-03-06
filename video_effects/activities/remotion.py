@@ -4,14 +4,152 @@ import json
 import logging
 import math
 import os
+from pathlib import Path
 
 from temporalio import activity
 
 from video_effects.helpers.llm import call_structured, load_prompt
 from video_effects.helpers.remotion import composite_overlay, render_media, render_still
 from video_effects.prompts.motion_graphics_schema import MotionGraphicsPlanResponse
+from video_effects.schemas.mg_templates import (
+    MGTemplateSpec,
+    MG_TEMPLATE_REGISTRY,
+    get_available_templates,
+    load_guidance,
+)
 
 logger = logging.getLogger(__name__)
+
+_PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts"
+
+
+# ---------------------------------------------------------------------------
+# Dynamic prompt assembly
+# ---------------------------------------------------------------------------
+
+
+def _render_template_section(spec: MGTemplateSpec) -> str:
+    """Format a single template's metadata + guidance into a markdown section."""
+    lines = [f"### {spec.name}", spec.description, ""]
+
+    # Props table
+    lines.append("| Prop | Type | Required | Default | Constraints |")
+    lines.append("|------|------|----------|---------|-------------|")
+    for p in spec.props:
+        constraints = ""
+        if p.choices:
+            constraints = " | ".join(p.choices)
+        elif p.min_value is not None or p.max_value is not None:
+            lo = p.min_value if p.min_value is not None else ""
+            hi = p.max_value if p.max_value is not None else ""
+            constraints = f"{lo}-{hi}"
+        lines.append(
+            f"| `{p.name}` | {p.type} | {'yes' if p.required else 'no'} "
+            f"| {p.default if p.default is not None else '-'} | {constraints} |"
+        )
+    lines.append("")
+
+    # Duration + spatial hints
+    lines.append(f"- **Duration**: {spec.duration_range[0]}-{spec.duration_range[1]} seconds")
+    sy = spec.spatial
+    lines.append(
+        f"- **Typical placement**: y {sy.typical_y_range[0]:.0%}-{sy.typical_y_range[1]:.0%}, "
+        f"x {sy.typical_x_range[0]:.0%}-{sy.typical_x_range[1]:.0%}"
+        + (" (edge-aligned)" if sy.edge_aligned else "")
+    )
+    lines.append("")
+
+    # Creative guidance
+    guidance = load_guidance(spec)
+    if guidance:
+        lines.append(guidance)
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def build_mg_system_prompt() -> str:
+    """Assemble the motion-graphics planner prompt from base + implemented templates."""
+    base = (_PROMPT_DIR / "plan_motion_graphics_base.md").read_text()
+
+    templates = get_available_templates()
+    if not templates:
+        section = "## Available Templates\n\nNo templates are currently implemented.\n"
+    else:
+        parts = ["## Available Templates\n"]
+        parts.append(f"You may ONLY use the following {len(templates)} template(s).\n")
+        for spec in templates:
+            parts.append(_render_template_section(spec))
+        section = "\n".join(parts)
+
+    return base.replace("{TEMPLATES}", section)
+
+
+def _validate_props(
+    components: list[dict],
+) -> tuple[list[dict], list[str]]:
+    """Validate and fix component props against the template registry.
+
+    - Drops components whose template is not implemented
+    - Checks required props are present
+    - Applies defaults for missing optional props
+    - Clamps numeric values to declared ranges
+    - Validates literal choices
+    """
+    issues: list[str] = []
+    validated: list[dict] = []
+
+    for comp in components:
+        tpl_name = comp.get("template", "")
+        spec = MG_TEMPLATE_REGISTRY.get(tpl_name)
+
+        if spec is None:
+            issues.append(f"Dropped unknown template '{tpl_name}' — not in registry")
+            continue
+
+        props = comp.get("props", {})
+
+        for p in spec.props:
+            if p.name not in props:
+                if p.required:
+                    issues.append(
+                        f"[{tpl_name}] Missing required prop '{p.name}' — skipping component"
+                    )
+                    break
+                if p.default is not None:
+                    props[p.name] = p.default
+            else:
+                val = props[p.name]
+
+                # Clamp numeric ranges
+                if p.type in ("int", "float") and isinstance(val, (int, float)):
+                    if p.min_value is not None and val < p.min_value:
+                        issues.append(
+                            f"[{tpl_name}] Clamped {p.name} from {val} to {p.min_value}"
+                        )
+                        val = p.min_value
+                    if p.max_value is not None and val > p.max_value:
+                        issues.append(
+                            f"[{tpl_name}] Clamped {p.name} from {val} to {p.max_value}"
+                        )
+                        val = p.max_value
+                    if p.type == "int":
+                        val = int(val)
+                    props[p.name] = val
+
+                # Validate literal choices
+                if p.choices and val not in p.choices:
+                    issues.append(
+                        f"[{tpl_name}] Invalid {p.name}='{val}', "
+                        f"expected one of {p.choices} — using default '{p.default}'"
+                    )
+                    props[p.name] = p.default if p.default is not None else p.choices[0]
+        else:
+            # Only reached if inner loop didn't break (all required props present)
+            comp["props"] = props
+            validated.append(comp)
+
+    return validated, issues
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +303,7 @@ def plan_motion_graphics(input_data: dict) -> dict:
     feedback = input_data.get("feedback", "")
     fps = input_data.get("video_fps", 30)
 
-    system_prompt = load_prompt("plan_motion_graphics.md")
+    system_prompt = build_mg_system_prompt()
 
     # Build user message
     lines = []
@@ -234,8 +372,13 @@ def plan_motion_graphics(input_data: dict) -> dict:
     components = raw_plan.get("components", [])
     logger.info("LLM planned %d motion graphics components", len(components))
 
-    # Validate and fix
+    # Validate props against template registry
+    components, prop_issues = _validate_props(components)
+    logger.info("Prop validation: %d kept, %d issues", len(components), len(prop_issues))
+
+    # Validate spatial/temporal rules
     validated, issues = _validate_plan(components, context, fps)
+    issues = prop_issues + issues
 
     # Convert to Remotion format (time -> frames)
     remotion_components = []
