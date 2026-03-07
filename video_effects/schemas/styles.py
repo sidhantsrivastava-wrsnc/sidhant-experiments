@@ -42,6 +42,8 @@ class StylePreset(BaseModel):
     template_preferences: list[str]  # preferred templates (empty = no preference)
     color_grading_preset: str  # "warm", "cool", "dramatic", ""
     color_grading_intensity: float  # 0.0-1.0
+    preferred_effects: list[str] = []  # e.g. ["whip", "vignette"]
+    avoided_effects: list[str] = []    # e.g. ["speed_ramp"]
 
 
 class StyleDesignResponse(BaseModel):
@@ -89,6 +91,8 @@ STYLE_PRESETS: dict[str, StylePreset] = {
         template_preferences=[],
         color_grading_preset="warm",
         color_grading_intensity=0.3,
+        preferred_effects=["vignette"],
+        avoided_effects=["whip", "speed_ramp"],
     ),
     "bold-energy": StylePreset(
         name="bold-energy",
@@ -109,6 +113,8 @@ STYLE_PRESETS: dict[str, StylePreset] = {
         template_preferences=[],
         color_grading_preset="dramatic",
         color_grading_intensity=0.6,
+        preferred_effects=["whip", "speed_ramp"],
+        avoided_effects=[],
     ),
     "tech-sleek": StylePreset(
         name="tech-sleek",
@@ -129,6 +135,8 @@ STYLE_PRESETS: dict[str, StylePreset] = {
         template_preferences=[],
         color_grading_preset="cool",
         color_grading_intensity=0.3,
+        preferred_effects=["whip", "vignette"],
+        avoided_effects=[],
     ),
     "casual-vlog": StylePreset(
         name="casual-vlog",
@@ -149,6 +157,8 @@ STYLE_PRESETS: dict[str, StylePreset] = {
         template_preferences=[],
         color_grading_preset="warm",
         color_grading_intensity=0.5,
+        preferred_effects=["vignette"],
+        avoided_effects=[],
     ),
     "podcast-pro": StylePreset(
         name="podcast-pro",
@@ -169,6 +179,8 @@ STYLE_PRESETS: dict[str, StylePreset] = {
         template_preferences=["lower_third"],
         color_grading_preset="",
         color_grading_intensity=0.0,
+        preferred_effects=[],
+        avoided_effects=["whip", "speed_ramp"],
     ),
     "tiktok-native": StylePreset(
         name="tiktok-native",
@@ -189,6 +201,8 @@ STYLE_PRESETS: dict[str, StylePreset] = {
         template_preferences=[],
         color_grading_preset="dramatic",
         color_grading_intensity=0.4,
+        preferred_effects=["whip", "speed_ramp"],
+        avoided_effects=[],
     ),
 }
 

@@ -73,6 +73,48 @@ Use on-screen text to reinforce key words, phrases, or numbers.
 
 Extract the exact words/numbers to display. Keep text SHORT (1-6 words max).
 
+### Whip Transition
+Use for dramatic section changes or topic transitions.
+
+**When to use:**
+- Speaker switches to a completely new topic → whip transition
+- Before/after a dramatic pause → whip for emphasis
+- Energy shift from calm to excited (or vice versa) → whip as punctuation
+
+**direction:** `"right"` default. Use `"left"` for flashbacks, `"up"` for energy increase, `"down"` for somber.
+**intensity:** 0.5 subtle, 1.0 standard, 1.5 dramatic
+**Duration:** Always 0.3-0.8 seconds. Whips are FAST.
+
+### Vignette
+Use for sustained cinematic focus during important sections.
+
+**When to use:**
+- Speaker tells a personal story → warm vignette for intimacy
+- Building tension or making a serious point → strong vignette to focus attention
+- Interview-style close-up sections → subtle vignette
+
+**strength:** 0.3 subtle, 0.5 standard, 0.8 dramatic
+**radius:** 0.8 typical (vignette starts 80% from center)
+**Duration:** 5-30 seconds. Vignettes work best over longer sections.
+
+### Zoom Blur (zoom effect modifier)
+When using zoom effects, optionally add `motion_blur` for a dynamic feel:
+- Fast zooms (snap/overshoot easing) → motion_blur: 0.5-0.8
+- Slow zooms (smooth easing) → motion_blur: 0-0.2
+- Bounce zooms → motion_blur: 0.3-0.5
+
+### Speed Ramp (visual)
+Creates a fast-forward visual effect for low-energy segments.
+
+**When to use:**
+- Speaker pauses or has filler content between key points
+- Transitioning through setup/context before the main point
+- Montage-style quick recap of multiple items
+
+**speed:** 2.0 gentle fast-forward, 4.0 dramatic, 8.0 extreme
+**easing:** `"smooth"` ramps up/down, `"snap"` instant speed change
+**Duration:** 2-10 seconds typically.
+
 ## Inference Rules
 
 1. **Read the energy, not the words.** "This is absolutely insane" → zoom in with snap easing. "So here's the thing..." → no zoom, maybe a subtle color shift.
@@ -88,3 +130,6 @@ Extract the exact words/numbers to display. Keep text SHORT (1-6 words max).
    - Blur: 3-5 seconds
    - Color change: duration of the tonal section (can be 10-30s)
    - Subtitle: duration of the spoken text + 1 second
+   - Whip: 0.3-0.8 seconds (always short)
+   - Vignette: 5-30 seconds (sustained sections)
+   - Speed ramp: 2-10 seconds

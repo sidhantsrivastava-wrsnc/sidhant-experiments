@@ -33,7 +33,7 @@ def design_style(input_data: dict) -> dict:
 
     if style_override:
         logger.info("Style override: %s", style_override)
-        return get_style(style_override).config.model_dump()
+        return {"config": get_style(style_override).config.model_dump(), "preset_name": style_override}
 
     transcript = input_data.get("transcript", "")
     video_duration = input_data.get("video_duration", 30.0)
@@ -77,4 +77,4 @@ def design_style(input_data: dict) -> dict:
             else:
                 base_config[key] = value
 
-    return base_config
+    return {"config": base_config, "preset_name": preset_name}

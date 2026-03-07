@@ -5,8 +5,8 @@ import {
   interpolate,
   spring,
 } from "remotion";
-import type { LowerThirdProps, NormalizedRect } from "../types";
-import { useFaceAvoidance } from "../lib/spatial";
+import type { LowerThirdProps } from "../types";
+import { useFaceAwareLayout } from "../lib/spatial";
 import { useStyle } from "../lib/styles";
 import { SPRING_GENTLE, SPRING_SMOOTH } from "../lib/easing";
 
@@ -16,12 +16,14 @@ export const LowerThird: React.FC<LowerThirdProps> = ({
   accentColor = "#FFD700",
   style = "slide",
   position,
+  anchor,
   fontSize = 36,
   color = "#FFFFFF",
 }) => {
   const frame = useCurrentFrame();
   const { fps, durationInFrames, width, height } = useVideoConfig();
-  const { offsetX, offsetY } = useFaceAvoidance(position);
+  const { left, top, scale, maxWidth } = useFaceAwareLayout(position, anchor);
+  const scaledFontSize = fontSize * scale;
   const s = useStyle();
 
   const fadeOutStart = durationInFrames - Math.round(fps * 0.5);
@@ -31,9 +33,6 @@ export const LowerThird: React.FC<LowerThirdProps> = ({
     [1, 0],
     { extrapolateLeft: "clamp", extrapolateRight: "clamp" },
   );
-
-  const left = position.x * width + offsetX * width;
-  const top = position.y * height + offsetY * height;
 
   if (style === "slide") {
     const barProgress = spring({ frame, fps, config: SPRING_GENTLE });
@@ -58,9 +57,11 @@ export const LowerThird: React.FC<LowerThirdProps> = ({
           position: "absolute",
           left,
           top,
+          maxWidth,
           display: "flex",
           flexDirection: "row",
           alignItems: "stretch",
+          overflow: "hidden",
           opacity: exitOpacity,
         }}
       >
@@ -69,7 +70,7 @@ export const LowerThird: React.FC<LowerThirdProps> = ({
             width: barWidth,
             backgroundColor: accentColor,
             borderRadius: 2,
-            minHeight: title ? fontSize * 2.2 : fontSize * 1.4,
+            minHeight: title ? scaledFontSize * 2.2 : scaledFontSize * 1.4,
           }}
         />
         <div
@@ -82,7 +83,7 @@ export const LowerThird: React.FC<LowerThirdProps> = ({
         >
           <div
             style={{
-              fontSize,
+              fontSize: scaledFontSize,
               color,
               fontWeight: s.font_weights.heading,
               fontFamily: s.font_family,
@@ -97,7 +98,7 @@ export const LowerThird: React.FC<LowerThirdProps> = ({
           {title && (
             <div
               style={{
-                fontSize: fontSize * 0.65,
+                fontSize: scaledFontSize * 0.65,
                 color,
                 fontWeight: s.font_weights.body,
                 fontFamily: s.font_family,
@@ -125,9 +126,11 @@ export const LowerThird: React.FC<LowerThirdProps> = ({
         position: "absolute",
         left,
         top,
+        maxWidth,
         display: "flex",
         flexDirection: "row",
         alignItems: "stretch",
+        overflow: "hidden",
         opacity: fadeProgress * exitOpacity,
       }}
     >
@@ -136,7 +139,7 @@ export const LowerThird: React.FC<LowerThirdProps> = ({
           width: 4,
           backgroundColor: accentColor,
           borderRadius: 2,
-          minHeight: title ? fontSize * 2.2 : fontSize * 1.4,
+          minHeight: title ? scaledFontSize * 2.2 : scaledFontSize * 1.4,
         }}
       />
       <div
@@ -149,7 +152,7 @@ export const LowerThird: React.FC<LowerThirdProps> = ({
       >
         <div
           style={{
-            fontSize,
+            fontSize: scaledFontSize,
             color,
             fontWeight: s.font_weights.heading,
             fontFamily: s.font_family,
@@ -162,7 +165,7 @@ export const LowerThird: React.FC<LowerThirdProps> = ({
         {title && (
           <div
             style={{
-              fontSize: fontSize * 0.65,
+              fontSize: scaledFontSize * 0.65,
               color,
               fontWeight: s.font_weights.body,
               fontFamily: s.font_family,

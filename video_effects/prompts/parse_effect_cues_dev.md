@@ -48,6 +48,24 @@ Analyze the transcript and extract every verbal cue that implies a video effect 
 - Extract the exact text they want displayed
 - Default position: bottom
 
+### Whip Transition
+- Triggered by: "whip", "swipe", "wipe transition", "swoosh", "fast cut"
+- **direction:** `"right"` default, `"left"` for flashbacks, `"up"` for energy, `"down"` for somber
+- **intensity:** 0.5 subtle, 1.0 standard, 1.5 dramatic
+- Duration: 0.3-0.8 seconds (always short)
+
+### Vignette
+- Triggered by: "vignette", "darken edges", "cinematic", "focus effect", "moody"
+- **strength:** 0.3 subtle, 0.5 standard, 0.8 dramatic
+- **radius:** 0.8 typical
+- Duration: 5-30 seconds (sustained)
+
+### Speed Ramp
+- Triggered by: "speed up", "fast forward", "speed ramp", "time lapse", "quick"
+- **speed:** 2.0 gentle, 4.0 dramatic, 8.0 extreme
+- **easing:** `"smooth"` ramps up/down, `"snap"` instant
+- Duration: 2-10 seconds
+
 ## Rules
 
 1. Each effect needs a start_time and end_time. If the speaker says "zoom in" at 5.2s, start at 5.2s and estimate a reasonable duration (2-5 seconds for zoom, until next cue for color changes).
@@ -60,3 +78,6 @@ Analyze the transcript and extract every verbal cue that implies a video effect 
    - Blur: duration of the relevant section, or 3-5 seconds
    - Color change: until the next color cue or end of section (can be long)
    - Subtitle: duration of the spoken text + 1 second
+   - Whip: 0.3-0.8 seconds (always short)
+   - Vignette: 5-30 seconds (sustained sections)
+   - Speed ramp: 2-10 seconds

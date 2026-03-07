@@ -77,7 +77,7 @@ export const DynamicComposition: React.FC<CompositionPlan> = ({
                 from={comp.startFrame}
                 durationInFrames={comp.durationInFrames}
               >
-                <Component {...comp.props} position={comp.bounds} />
+                <Component {...comp.props} position={comp.bounds} anchor={comp.anchor} />
               </Sequence>
             );
           })}

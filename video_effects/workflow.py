@@ -93,20 +93,34 @@ class VideoEffectsWorkflow:
         audio_path = audio_result["audio_path"]
         original_audio_path = audio_result["original_audio_path"]
 
-        # ── G2: Transcribe audio ──
-        transcript_result = await workflow.execute_activity(
+        # ── G2: Transcribe audio (+ optional jump cut detection in parallel) ──
+        transcribe_task = workflow.execute_activity(
             "vfx_transcribe_audio",
             {"audio_path": audio_path},
             start_to_close_timeout=activity_timeout,
         )
 
+        jump_cut_result = None
+        if input.smooth_jump_cuts:
+            jump_cut_task = workflow.execute_activity(
+                "vfx_detect_jump_cuts",
+                {"video_path": video_path, "video_info": video_info},
+                start_to_close_timeout=activity_timeout,
+                heartbeat_timeout=timedelta(minutes=5),
+            )
+            transcript_result, jump_cut_result = await asyncio.gather(
+                transcribe_task, jump_cut_task
+            )
+        else:
+            transcript_result = await transcribe_task
+
         # ── Creative Designer: auto-detect or apply style ──
         if input.style:
             style_config = get_style(input.style).config.model_dump()
-            style_preset = get_style(input.style)
+            style_preset_name = input.style
             workflow.logger.info("Using explicit style: %s", input.style)
         else:
-            style_config = await workflow.execute_child_workflow(
+            creative_result = await workflow.execute_child_workflow(
                 "CreativeDesignerWorkflow",
                 {
                     "transcript": transcript_result["transcript"],
@@ -115,8 +129,9 @@ class VideoEffectsWorkflow:
                 },
                 id=f"{workflow.info().workflow_id}/creative-designer",
             )
-            style_preset = None
-            workflow.logger.info("Creative designer returned style config")
+            style_config = creative_result["config"]
+            style_preset_name = creative_result["preset_name"]
+            workflow.logger.info("Creative designer picked style: %s", style_preset_name)
 
         # ── G3-G5 loop: parse → validate → approve (retries on rejection) ──
         rejection_feedback = ""
@@ -127,6 +142,7 @@ class VideoEffectsWorkflow:
                 "segments": transcript_result["segments"],
                 "duration": video_info["duration"],
                 "style_config": style_config,
+                "style_preset_name": style_preset_name,
                 "dev_mode": input.dev_mode,
             }
             if rejection_feedback:
@@ -184,20 +200,33 @@ class VideoEffectsWorkflow:
 
         effects = timeline.get("effects", [])
 
+        # Inject synthetic zoom cues for jump cut smoothing
+        if input.smooth_jump_cuts and jump_cut_result:
+            jump_cuts = jump_cut_result.get("jump_cuts", [])
+            for jc in jump_cuts:
+                effects.append({
+                    "effect_type": "zoom",
+                    "start_time": jc["time"] - 0.15,
+                    "end_time": jc["time"] + 0.35,
+                    "verbal_cue": "jump cut smoothing",
+                    "confidence": jc["confidence"],
+                    "zoom_params": {
+                        "tracking": "face",
+                        "zoom_level": 1.15,
+                        "easing": "smooth",
+                        "action": "bounce",
+                        "motion_blur": 0.3,
+                    },
+                })
+            if jump_cuts:
+                workflow.logger.info(
+                    "Injected %d synthetic zoom cues for jump cut smoothing", len(jump_cuts)
+                )
+
         # Inject color grading from style if applicable
-        grading_preset = ""
-        grading_intensity = 0.0
-        if style_preset:
-            grading_preset = style_preset.color_grading_preset
-            grading_intensity = style_preset.color_grading_intensity
-        elif style_config:
-            # Reverse-lookup preset from config to get grading info
-            from video_effects.schemas.styles import STYLE_PRESETS
-            for sp in STYLE_PRESETS.values():
-                if sp.config.font_import == style_config.get("font_import", ""):
-                    grading_preset = sp.color_grading_preset
-                    grading_intensity = sp.color_grading_intensity
-                    break
+        style_preset = get_style(style_preset_name)
+        grading_preset = style_preset.color_grading_preset
+        grading_intensity = style_preset.color_grading_intensity
 
         if grading_preset and grading_intensity > 0:
             duration = video_info.get("duration", 0)
@@ -239,6 +268,22 @@ class VideoEffectsWorkflow:
                 phases_executed=0,
             )
 
+        # ── G8a-G8b: MG planning + approval (parallel with G6b-G7) ──
+        mg_plan_task = None
+        if input.enable_motion_graphics:
+            mg_plan_task = self._plan_motion_graphics(
+                video_info=video_info,
+                transcript=transcript_result["transcript"],
+                segments=transcript_result["segments"],
+                effects=effects,
+                style_hint=input.style,
+                style_config=style_config,
+                style_preset_name=style_preset_name,
+                temp_dir=temp_dir,
+                auto_approve=input.auto_approve,
+                activity_timeout=activity_timeout,
+            )
+
         # ── G6b: Setup processors (face tracking, etc.) ──
         setup_result = await workflow.execute_activity(
             "vfx_setup_processors",
@@ -251,7 +296,7 @@ class VideoEffectsWorkflow:
         )
 
         # ── G6c: Render video frames ──
-        apply_result = await workflow.execute_activity(
+        render_task = workflow.execute_activity(
             "vfx_render_video",
             {
                 "video_path": video_path, "output_dir": temp_dir,
@@ -261,6 +306,13 @@ class VideoEffectsWorkflow:
             start_to_close_timeout=long_timeout,
             heartbeat_timeout=timedelta(minutes=2),
         )
+
+        # Wait for render + MG plan in parallel
+        if mg_plan_task is not None:
+            apply_result, mg_plan = await asyncio.gather(render_task, mg_plan_task)
+        else:
+            apply_result = await render_task
+            mg_plan = None
 
         # ── G7: Final composition + audio mux ──
         compose_result = await workflow.execute_activity(
@@ -277,20 +329,14 @@ class VideoEffectsWorkflow:
         base_output = compose_result["output_video"]
         mg_applied = 0
 
-        # ── G8a-G8e + G9: Motion graphics overlay (optional) ──
-        if input.enable_motion_graphics:
-            mg_applied = await self._run_motion_graphics(
+        # ── G8e + G9: Render overlay + composite (needs base video + approved plan) ──
+        if mg_plan is not None and mg_plan.get("components"):
+            mg_applied = await self._render_and_composite_mg(
+                mg_plan=mg_plan,
                 base_video=base_output,
                 output_path=output_path,
                 video_info=video_info,
-                transcript=transcript_result["transcript"],
-                segments=transcript_result["segments"],
-                effects=effects,
-                style_hint=input.style,
-                style_config=style_config,
-                style_preset=style_preset,
                 temp_dir=temp_dir,
-                auto_approve=input.auto_approve,
                 activity_timeout=activity_timeout,
                 long_timeout=long_timeout,
             )
@@ -303,33 +349,26 @@ class VideoEffectsWorkflow:
             motion_graphics_applied=mg_applied,
         )
 
-    async def _run_motion_graphics(
+    async def _plan_motion_graphics(
         self,
         *,
-        base_video: str,
-        output_path: str,
         video_info: dict,
         transcript: str,
         segments: list,
         effects: list,
         style_hint: str,
         style_config: dict | None = None,
-        style_preset: object | None = None,
+        style_preset_name: str = "",
         temp_dir: str,
         auto_approve: bool,
         activity_timeout: timedelta,
-        long_timeout: timedelta,
-    ) -> int:
-        """Run G8a-G8e + G9: plan, render, and composite motion graphics.
+    ) -> dict | None:
+        """Run G8a-G8b: build context, LLM plan, approval loop.
 
-        Returns number of components rendered (0 if skipped).
+        Returns approved composition plan dict, or None if skipped/rejected.
+        Runs in parallel with G6b-G7 (no dependency on rendered video).
         """
-        mg_dir = f"{temp_dir}/remotion"
-
-        width = video_info.get("width", 1920)
-        height = video_info.get("height", 1080)
         fps = int(video_info.get("fps", 30))
-        total_frames = video_info.get("total_frames", 0) or int(video_info.get("duration", 10) * fps)
 
         # ── G8a: Build Remotion context ──
         spatial_context = await workflow.execute_activity(
@@ -352,6 +391,7 @@ class VideoEffectsWorkflow:
                 "spatial_context": spatial_context,
                 "style_hint": style_hint,
                 "style_config": style_config,
+                "style_preset_name": style_preset_name,
                 "video_fps": fps,
             }
             if mg_feedback:
@@ -376,7 +416,7 @@ class VideoEffectsWorkflow:
 
             if not plan.get("components"):
                 workflow.logger.info("LLM produced no motion graphics components, skipping")
-                return 0
+                return None
 
             if issues:
                 workflow.logger.info("MG validation issues: %s", issues)
@@ -408,16 +448,37 @@ class VideoEffectsWorkflow:
             self._mg_plan_data = None  # Clear so CLI can detect new plan
         else:
             workflow.logger.warning("MG plan rejected %d times, skipping motion graphics", MAX_RETRIES)
-            return 0
+            return None
 
-        if not plan.get("components"):
-            return 0
+        return plan if plan.get("components") else None
+
+    async def _render_and_composite_mg(
+        self,
+        *,
+        mg_plan: dict,
+        base_video: str,
+        output_path: str,
+        video_info: dict,
+        temp_dir: str,
+        activity_timeout: timedelta,
+        long_timeout: timedelta,
+    ) -> int:
+        """Run G8e + G9: render overlay and composite onto base video.
+
+        Called after both the base video render and MG plan approval are done.
+        """
+        mg_dir = f"{temp_dir}/remotion"
+
+        width = video_info.get("width", 1920)
+        height = video_info.get("height", 1080)
+        fps = int(video_info.get("fps", 30))
+        total_frames = video_info.get("total_frames", 0) or int(video_info.get("duration", 10) * fps)
 
         # ── G8e: Render transparent overlay ──
         overlay_result = await workflow.execute_activity(
             "vfx_render_motion_overlay",
             {
-                "composition_plan": plan,
+                "composition_plan": mg_plan,
                 "output_dir": f"{mg_dir}/output",
                 "video_width": width,
                 "video_height": height,
@@ -433,8 +494,6 @@ class VideoEffectsWorkflow:
             return 0
 
         # ── G9: Composite overlay onto base video ──
-        # Activity writes to temp path then renames to output_path
-        # (FFmpeg can't overwrite its own input)
         await workflow.execute_activity(
             "vfx_composite_motion_graphics",
             {

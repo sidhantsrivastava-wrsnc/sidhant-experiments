@@ -5,8 +5,8 @@ import {
   interpolate,
   spring,
 } from "remotion";
-import type { ListicleProps, NormalizedRect } from "../types";
-import { useFaceAvoidance } from "../lib/spatial";
+import type { ListicleProps } from "../types";
+import { useFaceAwareLayout } from "../lib/spatial";
 import { useStyle } from "../lib/styles";
 import { SPRING_BOUNCY, SPRING_GENTLE } from "../lib/easing";
 
@@ -15,6 +15,7 @@ export const Listicle: React.FC<ListicleProps> = ({
   style = "pop",
   listStyle = "numbered",
   position,
+  anchor,
   staggerDelay = 10,
   fontSize = 32,
   color = "#FFFFFF",
@@ -22,7 +23,8 @@ export const Listicle: React.FC<ListicleProps> = ({
 }) => {
   const frame = useCurrentFrame();
   const { fps, durationInFrames, width, height } = useVideoConfig();
-  const { offsetX, offsetY } = useFaceAvoidance(position);
+  const { left, top, scale, maxWidth } = useFaceAwareLayout(position, anchor);
+  const scaledFontSize = fontSize * scale;
   const s = useStyle();
 
   const fadeOutStart = durationInFrames - Math.round(fps * 0.5);
@@ -32,9 +34,6 @@ export const Listicle: React.FC<ListicleProps> = ({
     [1, 0],
     { extrapolateLeft: "clamp", extrapolateRight: "clamp" },
   );
-
-  const left = position.x * width + offsetX * width;
-  const top = position.y * height + offsetY * height;
 
   const springConfig = style === "pop" ? SPRING_BOUNCY : SPRING_GENTLE;
 
@@ -50,9 +49,11 @@ export const Listicle: React.FC<ListicleProps> = ({
         position: "absolute",
         left,
         top,
+        maxWidth,
         display: "flex",
         flexDirection: "column",
-        gap: fontSize * 0.5,
+        gap: scaledFontSize * 0.5,
+        overflow: "hidden",
         opacity: exitOpacity,
       }}
     >
@@ -81,7 +82,7 @@ export const Listicle: React.FC<ListicleProps> = ({
               display: "flex",
               flexDirection: "row",
               alignItems: "baseline",
-              gap: fontSize * 0.4,
+              gap: scaledFontSize * 0.4,
               opacity: itemOpacity,
               transform:
                 style === "pop"
@@ -93,7 +94,7 @@ export const Listicle: React.FC<ListicleProps> = ({
             {marker && (
               <span
                 style={{
-                  fontSize: fontSize * 0.85,
+                  fontSize: scaledFontSize * 0.85,
                   color: accentColor,
                   fontWeight: s.font_weights.marker,
                   fontFamily: s.font_family,
@@ -105,7 +106,7 @@ export const Listicle: React.FC<ListicleProps> = ({
             )}
             <span
               style={{
-                fontSize,
+                fontSize: scaledFontSize,
                 color,
                 fontWeight: s.font_weights.body,
                 fontFamily: s.font_family,

@@ -6,8 +6,8 @@ import {
   spring,
   Easing,
 } from "remotion";
-import type { AnimatedTitleProps, NormalizedRect } from "../types";
-import { useFaceAvoidance } from "../lib/spatial";
+import type { AnimatedTitleProps } from "../types";
+import { useFaceAwareLayout } from "../lib/spatial";
 import { useStyle } from "../lib/styles";
 import { SPRING_GENTLE, SPRING_BOUNCY } from "../lib/easing";
 
@@ -15,13 +15,15 @@ export const AnimatedTitle: React.FC<AnimatedTitleProps> = ({
   text,
   style,
   position,
+  anchor,
   fontSize = 64,
   color = "#FFFFFF",
   fontWeight,
 }) => {
   const frame = useCurrentFrame();
   const { fps, durationInFrames, width, height } = useVideoConfig();
-  const { offsetX, offsetY } = useFaceAvoidance(position);
+  const { left, top, scale, maxWidth } = useFaceAwareLayout(position, anchor);
+  const scaledFontSize = fontSize * scale;
   const style_ = useStyle();
   const resolvedWeight = fontWeight ?? style_.font_weights.heading;
 
@@ -56,21 +58,19 @@ export const AnimatedTitle: React.FC<AnimatedTitleProps> = ({
     const displayText = text.slice(0, charsToShow);
     opacity = exitOpacity;
 
-    const left = position.x * width + offsetX * width;
-    const top = position.y * height + offsetY * height;
-
     return (
       <div
         style={{
           position: "absolute",
           left,
           top,
-          fontSize,
+          maxWidth,
+          fontSize: scaledFontSize,
           color,
           fontWeight: resolvedWeight,
           fontFamily: style_.font_family,
           opacity,
-          whiteSpace: "nowrap",
+          overflow: "hidden",
           textShadow: style_.text_shadow,
         }}
       >
@@ -80,11 +80,8 @@ export const AnimatedTitle: React.FC<AnimatedTitleProps> = ({
     );
   } else if (style === "bounce") {
     const progress = spring({ frame, fps, config: SPRING_BOUNCY });
-    const scale = interpolate(progress, [0, 1], [0.3, 1]);
+    const bounceScale = interpolate(progress, [0, 1], [0.3, 1]);
     opacity = exitOpacity * progress;
-
-    const left = position.x * width + offsetX * width;
-    const top = position.y * height + offsetY * height;
 
     return (
       <div
@@ -92,14 +89,15 @@ export const AnimatedTitle: React.FC<AnimatedTitleProps> = ({
           position: "absolute",
           left,
           top,
-          fontSize,
+          maxWidth,
+          fontSize: scaledFontSize,
           color,
           fontWeight: resolvedWeight,
           fontFamily: style_.font_family,
           opacity,
-          transform: `scale(${scale})`,
+          transform: `scale(${bounceScale})`,
           transformOrigin: "left top",
-          whiteSpace: "nowrap",
+          overflow: "hidden",
           textShadow: style_.text_shadow,
         }}
       >
@@ -108,21 +106,19 @@ export const AnimatedTitle: React.FC<AnimatedTitleProps> = ({
     );
   }
 
-  const left = position.x * width + (translateX + offsetX * width);
-  const top = position.y * height + (translateY + offsetY * height);
-
   return (
     <div
       style={{
         position: "absolute",
-        left,
-        top,
-        fontSize,
+        left: left + translateX,
+        top: top + translateY,
+        maxWidth,
+        fontSize: scaledFontSize,
         color,
         fontWeight: resolvedWeight,
         fontFamily: style_.font_family,
         opacity,
-        whiteSpace: "nowrap",
+        overflow: "hidden",
         textShadow: style_.text_shadow,
       }}
     >

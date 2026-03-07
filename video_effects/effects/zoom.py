@@ -210,6 +210,19 @@ class ZoomEffect(BaseEffect):
                 result, M, (w, h), borderMode=cv2.BORDER_REPLICATE
             )
 
+            # Radial motion blur (zoom blur effect)
+            if params.motion_blur > 0 and intensity > 0.05:
+                blur_strength = params.motion_blur * intensity
+                extra_zoom = 1.0 + blur_strength * 0.08
+                # Apply extra zoom relative to output frame center (result is already centered)
+                M_blur = np.float32([
+                    [extra_zoom, 0, (w / 2) * (1 - extra_zoom)],
+                    [0, extra_zoom, (h / 2) * (1 - extra_zoom)],
+                ])
+                blurred = cv2.warpAffine(result, M_blur, (w, h), borderMode=cv2.BORDER_REPLICATE)
+                alpha = min(0.7, blur_strength * 0.5)
+                result = cv2.addWeighted(result, 1.0 - alpha, blurred, alpha, 0)
+
         return result
 
     def _ease_bounce(self, t: float, easing: str) -> float:

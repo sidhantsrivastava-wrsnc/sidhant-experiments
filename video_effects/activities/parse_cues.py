@@ -6,26 +6,24 @@ from temporalio import activity
 
 from video_effects.helpers.llm import call_structured, load_prompt
 from video_effects.prompts.schema import ParsedEffectCues
-from video_effects.schemas.styles import STYLE_PRESETS
+from video_effects.schemas.styles import get_style
 
 logger = logging.getLogger(__name__)
 
 
-def _build_effects_style_guide(style_config: dict | None) -> str:
+def _build_effects_style_guide(style_config: dict | None, style_preset_name: str = "") -> str:
     """Build style guide section for the effect cue parser."""
-    if not style_config:
+    if not style_preset_name and not style_config:
         return ""
 
-    preset = None
-    font_import = style_config.get("font_import", "")
-    if font_import:
-        for sp in STYLE_PRESETS.values():
-            if sp.config.font_import == font_import:
-                preset = sp
-                break
+    preset = get_style(style_preset_name) if style_preset_name else None
 
-    if not preset:
-        return ""
+    if not preset or preset.name == "default":
+        if not style_config:
+            return ""
+        # No preset found and no config — nothing to guide
+        if not style_preset_name:
+            return ""
 
     lines = ["## Style Context\n"]
     lines.append(f"**Style: {preset.display_name}** — {preset.description}\n")
@@ -46,6 +44,11 @@ def _build_effects_style_guide(style_config: dict | None) -> str:
         else:
             lines.append("**Energy**: Calm — use smooth easing, subtle zoom levels (1.2-1.3), fewer effects.")
 
+    if preset.preferred_effects:
+        lines.append(f"**Preferred effects**: Use {', '.join(preset.preferred_effects)} when the content warrants it.")
+    if preset.avoided_effects:
+        lines.append(f"**Avoid**: Do NOT use {', '.join(preset.avoided_effects)} unless explicitly requested.")
+
     lines.append("")
     return "\n".join(lines)
 
@@ -64,11 +67,12 @@ async def parse_effect_cues(input_data: dict) -> dict:
     duration = input_data.get("duration", 0)
     feedback = input_data.get("feedback", "")
     style_config = input_data.get("style_config")
+    style_preset_name = input_data.get("style_preset_name", "")
     dev_mode = input_data.get("dev_mode", False)
 
     prompt_name = "parse_effect_cues_dev.md" if dev_mode else "parse_effect_cues.md"
     system_prompt = load_prompt(prompt_name)
-    style_guide = _build_effects_style_guide(style_config)
+    style_guide = _build_effects_style_guide(style_config, style_preset_name)
     system_prompt = system_prompt.replace("{STYLE_GUIDE}", style_guide)
 
     # Build user message with timestamped transcript

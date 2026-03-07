@@ -9,6 +9,9 @@ class EffectType(str, Enum):
     BLUR = "blur"
     COLOR_CHANGE = "color_change"
     SUBTITLE = "subtitle"
+    WHIP = "whip"
+    SPEED_RAMP = "speed_ramp"
+    VIGNETTE = "vignette"
 
 
 class TargetRegion(BaseModel):
@@ -24,6 +27,22 @@ class ZoomParams(BaseModel):
     zoom_level: float = Field(1.5, ge=1.0, le=3.0, description="Zoom magnification level")
     easing: Literal["smooth", "snap", "overshoot"] = "smooth"
     action: Literal["bounce", "in", "out"] = "bounce"
+    motion_blur: float = Field(0.0, ge=0.0, le=1.0, description="Radial motion blur during zoom transition (0=off)")
+
+
+class WhipParams(BaseModel):
+    direction: Literal["left", "right", "up", "down"] = "right"
+    intensity: float = Field(1.0, ge=0.3, le=2.0, description="Motion blur strength multiplier")
+
+
+class SpeedRampParams(BaseModel):
+    speed: float = Field(2.0, ge=1.5, le=8.0, description="Playback speed multiplier")
+    easing: Literal["smooth", "snap"] = "smooth"
+
+
+class VignetteParams(BaseModel):
+    strength: float = Field(0.5, ge=0.1, le=1.0, description="Darkness of vignette edges")
+    radius: float = Field(0.8, ge=0.3, le=1.0, description="How far from center vignette starts (1.0 = no vignette)")
 
 
 class BlurParams(BaseModel):
@@ -63,6 +82,9 @@ class EffectCue(BaseModel):
     blur_params: Optional[BlurParams] = None
     color_params: Optional[ColorParams] = None
     subtitle_params: Optional[SubtitleParams] = None
+    whip_params: Optional[WhipParams] = None
+    speed_ramp_params: Optional[SpeedRampParams] = None
+    vignette_params: Optional[VignetteParams] = None
 
 
 class ValidatedTimeline(BaseModel):

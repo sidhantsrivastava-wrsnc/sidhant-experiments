@@ -5,8 +5,8 @@ import {
   interpolate,
   spring,
 } from "remotion";
-import type { DataAnimationProps, NormalizedRect } from "../types";
-import { useFaceAvoidance } from "../lib/spatial";
+import type { DataAnimationProps } from "../types";
+import { useFaceAwareLayout } from "../lib/spatial";
 import { useStyle } from "../lib/styles";
 import { SPRING_SNAPPY, SPRING_GENTLE } from "../lib/easing";
 
@@ -15,6 +15,7 @@ export const DataAnimation: React.FC<DataAnimationProps> = ({
   value,
   label,
   position,
+  anchor,
   startValue = 0,
   suffix = "",
   prefix = "",
@@ -26,7 +27,8 @@ export const DataAnimation: React.FC<DataAnimationProps> = ({
 }) => {
   const frame = useCurrentFrame();
   const { fps, durationInFrames, width, height } = useVideoConfig();
-  const { offsetX, offsetY } = useFaceAvoidance(position);
+  const { left, top, scale, maxWidth } = useFaceAwareLayout(position, anchor);
+  const scaledFontSize = fontSize * scale;
   const s = useStyle();
 
   const fadeOutStart = durationInFrames - Math.round(fps * 0.5);
@@ -36,9 +38,6 @@ export const DataAnimation: React.FC<DataAnimationProps> = ({
     [1, 0],
     { extrapolateLeft: "clamp", extrapolateRight: "clamp" },
   );
-
-  const left = position.x * width + offsetX * width;
-  const top = position.y * height + offsetY * height;
 
   const progress = spring({ frame, fps, config: SPRING_SNAPPY });
 
@@ -55,15 +54,17 @@ export const DataAnimation: React.FC<DataAnimationProps> = ({
           position: "absolute",
           left,
           top,
+          maxWidth,
           display: "flex",
           flexDirection: "column",
           alignItems: "center",
+          overflow: "hidden",
           opacity: progress * exitOpacity,
         }}
       >
         <div
           style={{
-            fontSize,
+            fontSize: scaledFontSize,
             color,
             fontWeight: s.font_weights.emphasis,
             fontFamily: s.font_family,
@@ -75,7 +76,7 @@ export const DataAnimation: React.FC<DataAnimationProps> = ({
         </div>
         <div
           style={{
-            fontSize: fontSize * 0.4,
+            fontSize: scaledFontSize * 0.4,
             color,
             fontWeight: s.font_weights.body,
             fontFamily: s.font_family,
@@ -114,15 +115,17 @@ export const DataAnimation: React.FC<DataAnimationProps> = ({
           position: "absolute",
           left,
           top,
+          maxWidth,
           display: "flex",
           flexDirection: "column",
           alignItems: "flex-start",
+          overflow: "hidden",
           opacity: progress * exitOpacity,
         }}
       >
         <div
           style={{
-            fontSize,
+            fontSize: scaledFontSize,
             color,
             fontWeight: s.font_weights.emphasis,
             fontFamily: s.font_family,
@@ -139,7 +142,7 @@ export const DataAnimation: React.FC<DataAnimationProps> = ({
           {deltaText && (
             <span
               style={{
-                fontSize: fontSize * 0.4,
+                fontSize: scaledFontSize * 0.4,
                 color: deltaColor,
                 fontWeight: s.font_weights.emphasis,
               }}
@@ -150,7 +153,7 @@ export const DataAnimation: React.FC<DataAnimationProps> = ({
         </div>
         <div
           style={{
-            fontSize: fontSize * 0.4,
+            fontSize: scaledFontSize * 0.4,
             color,
             fontWeight: s.font_weights.body,
             fontFamily: s.font_family,
@@ -168,7 +171,7 @@ export const DataAnimation: React.FC<DataAnimationProps> = ({
   // bar style
   const barItems = items ?? [{ label, value }];
   const maxBarValue = Math.max(...barItems.map((it) => it.value), 1);
-  const barHeight = fontSize * 0.7;
+  const barHeight = scaledFontSize * 0.7;
   const maxBarWidth = position.w * width * 0.8;
 
   return (
@@ -177,9 +180,11 @@ export const DataAnimation: React.FC<DataAnimationProps> = ({
         position: "absolute",
         left,
         top,
+        maxWidth,
         display: "flex",
         flexDirection: "column",
         gap: barHeight * 0.6,
+        overflow: "hidden",
         opacity: exitOpacity,
       }}
     >
@@ -208,7 +213,7 @@ export const DataAnimation: React.FC<DataAnimationProps> = ({
           >
             <div
               style={{
-                fontSize: fontSize * 0.35,
+                fontSize: scaledFontSize * 0.35,
                 color,
                 fontWeight: s.font_weights.body,
                 fontFamily: s.font_family,
@@ -235,7 +240,7 @@ export const DataAnimation: React.FC<DataAnimationProps> = ({
               />
               <span
                 style={{
-                  fontSize: fontSize * 0.35,
+                  fontSize: scaledFontSize * 0.35,
                   color,
                   fontWeight: s.font_weights.marker,
                   fontFamily: s.font_family,

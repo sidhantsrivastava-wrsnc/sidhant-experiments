@@ -13,6 +13,8 @@ export interface NormalizedRect {
   label?: string;
 }
 
+export type AnchorMode = "static" | "face-right" | "face-left" | "face-below" | "face-above" | "face-beside";
+
 export interface ComponentSpec {
   template: string;
   startFrame: number;
@@ -20,6 +22,7 @@ export interface ComponentSpec {
   props: Record<string, unknown>;
   bounds: NormalizedRect;
   zIndex: number;
+  anchor?: AnchorMode;
 }
 
 export interface FontWeights {
@@ -56,6 +59,7 @@ export interface AnimatedTitleProps {
   text: string;
   style: "fade" | "slide-in" | "typewriter" | "bounce";
   position: NormalizedRect;
+  anchor?: AnchorMode;
   fontSize?: number;
   color?: string;
   fontWeight?: string;
@@ -67,6 +71,7 @@ export interface LowerThirdProps {
   accentColor?: string;
   style?: "slide" | "fade";
   position: NormalizedRect;
+  anchor?: AnchorMode;
   fontSize?: number;
   color?: string;
 }
@@ -76,6 +81,7 @@ export interface ListicleProps {
   style?: "pop" | "slide";
   listStyle?: "numbered" | "bullet" | "none";
   position: NormalizedRect;
+  anchor?: AnchorMode;
   staggerDelay?: number;
   fontSize?: number;
   color?: string;
@@ -87,6 +93,7 @@ export interface DataAnimationProps {
   value: number;
   label: string;
   position: NormalizedRect;
+  anchor?: AnchorMode;
   startValue?: number;
   suffix?: string;
   prefix?: string;

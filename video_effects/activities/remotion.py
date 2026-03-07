@@ -17,7 +17,7 @@ from video_effects.schemas.mg_templates import (
     get_available_templates,
     load_guidance,
 )
-from video_effects.schemas.styles import STYLE_PRESETS, StyleConfig, StylePreset
+from video_effects.schemas.styles import StyleConfig, StylePreset, get_style
 
 logger = logging.getLogger(__name__)
 
@@ -69,21 +69,14 @@ def _render_template_section(spec: MGTemplateSpec) -> str:
     return "\n".join(lines)
 
 
-def _build_style_guide(style_config: dict | None) -> str:
+def _build_style_guide(style_config: dict | None, style_preset_name: str = "") -> str:
     """Build the style guide section for the MG planner prompt."""
-    if not style_config:
+    if not style_config and not style_preset_name:
         return ""
 
-    # Try to find matching preset for guidance
-    preset = None
-    font_import = style_config.get("font_import", "")
-    if font_import:
-        for sp in STYLE_PRESETS.values():
-            if sp.config.font_import == font_import:
-                preset = sp
-                break
+    preset = get_style(style_preset_name) if style_preset_name else None
 
-    palette = style_config.get("palette", [])
+    palette = (style_config or {}).get("palette", [])
     palette_desc = ""
     if len(palette) >= 3:
         palette_desc = f"{palette[0]} (text), {palette[1]} (secondary), {palette[2]} (accent)"
@@ -91,12 +84,12 @@ def _build_style_guide(style_config: dict | None) -> str:
         palette_desc = ", ".join(palette)
 
     lines = ["## Style Guide\n"]
-    if preset:
+    if preset and preset.name != "default":
         lines.append(f"**Style: {preset.display_name}**\n")
 
     if palette_desc:
         lines.append(f"**Color palette**: Use ONLY these colors: {palette_desc}")
-    if preset:
+    if preset and preset.name != "default":
         if preset.preferred_animations:
             lines.append(f"**Animations**: Prefer {', '.join(preset.preferred_animations)}.")
         if preset.avoided_animations:
@@ -105,16 +98,20 @@ def _build_style_guide(style_config: dict | None) -> str:
         lines.append(f"**Density**: {preset.density_label} — target {lo}-{hi} overlays per 60 seconds.")
         if preset.template_preferences:
             lines.append(f"**Preferred templates**: {', '.join(preset.template_preferences)}")
+        if preset.preferred_effects:
+            lines.append(f"**Preferred effects**: Use {', '.join(preset.preferred_effects)} when the content warrants it.")
+        if preset.avoided_effects:
+            lines.append(f"**Avoid**: Do NOT use {', '.join(preset.avoided_effects)} unless explicitly requested.")
 
     lines.append("")
     return "\n".join(lines)
 
 
-def build_mg_system_prompt(style_config: dict | None = None) -> str:
+def build_mg_system_prompt(style_config: dict | None = None, style_preset_name: str = "") -> str:
     """Assemble the motion-graphics planner prompt from base + style + templates."""
     base = (_PROMPT_DIR / "plan_motion_graphics_base.md").read_text()
 
-    style_guide = _build_style_guide(style_config)
+    style_guide = _build_style_guide(style_config, style_preset_name)
 
     templates = get_available_templates()
     if not templates:
@@ -374,10 +371,11 @@ def plan_motion_graphics(input_data: dict) -> dict:
     context = input_data["spatial_context"]
     style_hint = input_data.get("style_hint", "")
     style_config = input_data.get("style_config")
+    style_preset_name = input_data.get("style_preset_name", "")
     feedback = input_data.get("feedback", "")
     fps = input_data.get("video_fps", 30)
 
-    system_prompt = build_mg_system_prompt(style_config=style_config)
+    system_prompt = build_mg_system_prompt(style_config=style_config, style_preset_name=style_preset_name)
 
     # Build user message
     lines = []
@@ -468,6 +466,7 @@ def plan_motion_graphics(input_data: dict) -> dict:
             "props": comp.get("props", {}),
             "bounds": comp.get("bounds", {"x": 0.1, "y": 0.1, "w": 0.3, "h": 0.1}),
             "zIndex": comp.get("z_index", 0),
+            "anchor": comp.get("anchor", "static"),
         })
 
     composition_plan = {
@@ -504,6 +503,36 @@ def _validate_plan(
         return components, issues
 
     duration = context.get("video", {}).get("duration", 999)
+
+    # Hard bounds clamping — keep components within safe frame
+    for comp in components:
+        bounds = comp.get("bounds", {})
+        bx = bounds.get("x", 0.1)
+        by = bounds.get("y", 0.1)
+        bw = bounds.get("w", 0.2)
+        bh = bounds.get("h", 0.1)
+
+        # Ensure minimum dimensions
+        bw = max(bw, 0.05)
+        bh = max(bh, 0.03)
+
+        # Clamp origin to safe range
+        bx = max(0.02, min(bx, 0.98))
+        by = max(0.02, min(by, 0.98))
+
+        # Clamp right/bottom edges
+        if bx + bw > 0.98:
+            bw = 0.98 - bx
+        if by + bh > 0.98:
+            bh = 0.98 - by
+
+        if (bx, by, bw, bh) != (bounds.get("x"), bounds.get("y"), bounds.get("w"), bounds.get("h")):
+            issues.append(f"Clamped {comp.get('template', '?')} bounds to safe frame")
+
+        bounds["x"] = bx
+        bounds["y"] = by
+        bounds["w"] = bw
+        bounds["h"] = bh
 
     # Clamp times to video duration
     for comp in components:

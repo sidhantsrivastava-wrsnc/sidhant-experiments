@@ -1,5 +1,7 @@
 """Pydantic schema for LLM structured output (motion graphics planning)."""
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -22,6 +24,10 @@ class MGComponentSpec(BaseModel):
         description="Normalized screen region this component occupies",
     )
     z_index: int = Field(0, description="Layering order (higher = on top)")
+    anchor: Literal["static", "face-right", "face-left", "face-below", "face-above", "face-beside"] = Field(
+        "static",
+        description="Positioning mode. 'static' uses bounds as-is. 'face-*' positions relative to speaker's face. 'face-beside' auto-picks left/right based on available space.",
+    )
     reasoning: str = Field("", description="Why this component is placed here")
 
 

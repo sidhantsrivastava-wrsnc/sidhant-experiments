@@ -67,6 +67,15 @@ def _print_timeline(timeline: dict) -> None:
             sp = e["subtitle_params"]
             text = sp.get("text", "")
             detail = f' ["{text}"]'
+        elif etype == "whip" and e.get("whip_params"):
+            wp = e["whip_params"]
+            detail = f" [{wp.get('direction', '?')} {wp.get('intensity', '?')}x]"
+        elif etype == "speed_ramp" and e.get("speed_ramp_params"):
+            srp = e["speed_ramp_params"]
+            detail = f" [{srp.get('speed', '?')}x {srp.get('easing', '?')}]"
+        elif etype == "vignette" and e.get("vignette_params"):
+            vp = e["vignette_params"]
+            detail = f" [str={vp.get('strength', '?')} r={vp.get('radius', '?')}]"
 
         print(f"  {i:<4} {etype + detail:<30} {start:>6.1f}s {end:>6.1f}s {conf:>4.0%}  {cue}")
 
@@ -157,6 +166,7 @@ async def run_workflow(args) -> None:
         enable_motion_graphics=args.motion_graphics,
         style=args.style,
         dev_mode=args.dev,
+        smooth_jump_cuts=args.smooth_cuts,
     )
 
     print(f"Starting Video Effects workflow: {workflow_id}")
@@ -328,6 +338,11 @@ def main():
         "--dev",
         action="store_true",
         help="Dev mode: effects triggered by explicit verbal commands instead of inferred",
+    )
+    run_parser.add_argument(
+        "--smooth-cuts",
+        action="store_true",
+        help="Detect jump cuts and insert synthetic zoom transitions to smooth them",
     )
 
     args = parser.parse_args()

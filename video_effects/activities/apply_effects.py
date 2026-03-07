@@ -16,7 +16,10 @@ import numpy as np
 from temporalio import activity
 
 from video_effects.effect_registry import group_by_phase
-from video_effects.effects import ZoomEffect, BlurEffect, ColorEffect, SubtitleEffect
+from video_effects.effects import (
+    ZoomEffect, BlurEffect, ColorEffect, SubtitleEffect,
+    WhipEffect, VignetteEffect, SpeedRampEffect,
+)
 from video_effects.effects.base import EffectContext
 from video_effects.schemas.effects import EffectCue, EffectType, VideoInfo
 
@@ -31,10 +34,13 @@ def _is_hdr(video_info: VideoInfo) -> bool:
 
 
 EFFECT_PROCESSORS = {
+    EffectType.VIGNETTE: VignetteEffect,
     EffectType.ZOOM: ZoomEffect,
     EffectType.BLUR: BlurEffect,
     EffectType.COLOR_CHANGE: ColorEffect,
     EffectType.SUBTITLE: SubtitleEffect,
+    EffectType.WHIP: WhipEffect,
+    EffectType.SPEED_RAMP: SpeedRampEffect,
 }
 
 

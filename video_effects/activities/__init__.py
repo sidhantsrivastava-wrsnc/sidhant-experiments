@@ -12,6 +12,7 @@ from .remotion import (
     composite_motion_graphics,
     preview_motion_graphics,
 )
+from .detect_jump_cuts import detect_jump_cuts
 
 ALL_VIDEO_EFFECTS_ACTIVITIES = [
     get_video_info,
@@ -30,4 +31,5 @@ ALL_VIDEO_EFFECTS_ACTIVITIES = [
     render_motion_overlay,
     composite_motion_graphics,
     preview_motion_graphics,
+    detect_jump_cuts,
 ]

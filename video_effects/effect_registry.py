@@ -3,10 +3,13 @@ from video_effects.schemas.effects import EffectType
 # Phase ordering — lower numbers execute first.
 # Gaps allow inserting new phases without renumbering.
 EFFECT_PHASES: dict[EffectType, int] = {
+    EffectType.VIGNETTE: 5,       # Phase 0.5: vignette (under color grading)
     EffectType.COLOR_CHANGE: 10,  # Phase 1: color grading (pixel-level, no geometry)
     EffectType.BLUR: 20,          # Phase 2: blur regions (before overlays)
+    EffectType.WHIP: 25,          # Phase 2.5: whip transitions
     EffectType.ZOOM: 30,          # Phase 3: zoom/crop (geometric transform)
     EffectType.SUBTITLE: 40,      # Phase 4: text overlays (on top of everything)
+    EffectType.SPEED_RAMP: 50,    # Phase 5: speed ramp (visual, runs last)
 }
 
 
