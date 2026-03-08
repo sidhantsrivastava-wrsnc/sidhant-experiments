@@ -41,8 +41,10 @@ export const DataAnimation: React.FC<DataAnimationProps> = ({
 
   const progress = spring({ frame, fps, config: SPRING_SNAPPY });
 
-  const animatedValue = interpolate(progress, [0, 1], [startValue, value]);
-  const isInteger = Number.isInteger(value) && Number.isInteger(startValue);
+  const numValue = Number(value) || 0;
+  const numStartValue = Number(startValue) || 0;
+  const animatedValue = interpolate(progress, [0, 1], [numStartValue, numValue]);
+  const isInteger = Number.isInteger(numValue) && Number.isInteger(numStartValue);
   const displayValue = isInteger
     ? Math.round(animatedValue).toLocaleString()
     : animatedValue.toFixed(1);
@@ -169,7 +171,7 @@ export const DataAnimation: React.FC<DataAnimationProps> = ({
   }
 
   // bar style
-  const barItems = items ?? [{ label, value }];
+  const barItems = Array.isArray(items) ? items : [{ label, value }];
   const maxBarValue = Math.max(...barItems.map((it) => it.value), 1);
   const barHeight = scaledFontSize * 0.7;
   const maxBarWidth = position.w * width * 0.8;

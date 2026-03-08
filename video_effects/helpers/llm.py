@@ -70,3 +70,37 @@ def call_structured(
             return block.input
 
     raise ValueError("LLM did not return structured output via tool use")
+
+
+def call_text(
+    system_prompt: str,
+    user_message: str,
+    model: str | None = None,
+    max_tokens: int = 8192,
+) -> str:
+    """Call Claude and return raw text response (for code generation).
+
+    Args:
+        system_prompt: System prompt text.
+        user_message: User message content.
+        model: Model ID override. Defaults to settings.LLM_MODEL.
+        max_tokens: Max tokens in response.
+
+    Returns:
+        Raw text string from the model.
+    """
+    client = get_client()
+    model = model or settings.LLM_MODEL
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=max_tokens,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_message}],
+    )
+
+    for block in response.content:
+        if block.type == "text":
+            return block.text
+
+    raise ValueError("LLM did not return text output")

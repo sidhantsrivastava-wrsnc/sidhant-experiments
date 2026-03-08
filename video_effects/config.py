@@ -35,5 +35,9 @@ class VideoEffectsSettings(BaseSettings):
     REMOTION_DIR: Optional[str] = None  # Override path to remotion/ project (default: auto-detected)
     REMOTION_CONCURRENCY: Optional[int] = None  # Remotion render concurrency (default: Remotion auto)
 
+    # Infographic code generation
+    INFOGRAPHIC_MAX_RETRIES: int = 3  # Max code-gen + validate attempts per infographic
+    INFOGRAPHIC_LLM_MODEL: str = "claude-opus-4-6"  # Use Opus for codegen quality
+
 
 settings = VideoEffectsSettings()

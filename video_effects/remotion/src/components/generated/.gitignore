@@ -1,0 +1,4 @@
+# Ignore all generated infographic components (created at runtime)
+*.tsx
+_registry.ts
+!.gitignore

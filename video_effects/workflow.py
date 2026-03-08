@@ -200,6 +200,9 @@ class VideoEffectsWorkflow:
 
         effects = timeline.get("effects", [])
 
+        # Filter out subtitle effects — Remotion handles text overlays
+        effects = [e for e in effects if e.get("effect_type") != "subtitle"]
+
         # Inject synthetic zoom cues for jump cut smoothing
         if input.smooth_jump_cuts and jump_cut_result:
             jump_cuts = jump_cut_result.get("jump_cuts", [])
@@ -246,7 +249,9 @@ class VideoEffectsWorkflow:
                 grading_preset, grading_intensity * 100,
             )
 
-        if not effects:
+        enable_infographics = getattr(input, "enable_infographics", False)
+        has_transcript = bool(transcript_result.get("segments"))
+        if not effects and not input.enable_motion_graphics and not enable_infographics and not has_transcript:
             return VideoEffectsOutput(
                 output_video=video_path,
                 effects_applied=0,
@@ -260,7 +265,7 @@ class VideoEffectsWorkflow:
             start_to_close_timeout=activity_timeout,
         )
 
-        if not render_plan.get("has_effects"):
+        if not render_plan.get("has_effects") and not input.enable_motion_graphics and not enable_infographics and not has_transcript:
             return VideoEffectsOutput(
                 output_video=video_path,
                 effects_applied=len(effects),
@@ -268,10 +273,26 @@ class VideoEffectsWorkflow:
                 phases_executed=0,
             )
 
-        # ── G8a-G8b: MG planning + approval (parallel with G6b-G7) ──
+        # ── G8a: Build spatial context (shared by MG planning + infographics + subtitles) ──
+        spatial_context = None
+        if True:  # Always build — subtitles always need it
+            spatial_context = await workflow.execute_activity(
+                "vfx_build_remotion_context",
+                {
+                    "video_info": video_info,
+                    "transcript": transcript_result["transcript"],
+                    "segments": transcript_result["segments"],
+                    "effects": effects,
+                    "cache_dir": temp_dir,
+                },
+                start_to_close_timeout=activity_timeout,
+            )
+
+        # ── G8b: MG planning + approval (parallel with G6b-G7) ──
         mg_plan_task = None
-        if input.enable_motion_graphics:
+        if input.enable_motion_graphics and spatial_context:
             mg_plan_task = self._plan_motion_graphics(
+                spatial_context=spatial_context,
                 video_info=video_info,
                 transcript=transcript_result["transcript"],
                 segments=transcript_result["segments"],
@@ -282,6 +303,24 @@ class VideoEffectsWorkflow:
                 temp_dir=temp_dir,
                 auto_approve=input.auto_approve,
                 activity_timeout=activity_timeout,
+            )
+
+        # ── Infographic generation (parallel with MG planning + video render) ──
+        infographic_task = None
+        if enable_infographics and spatial_context:
+            wf_prefix = workflow.info().workflow_id.split("-")[-1][:6]
+            infographic_task = workflow.execute_child_workflow(
+                "InfographicGeneratorWorkflow",
+                {
+                    "spatial_context": spatial_context,
+                    "transcript": transcript_result["transcript"],
+                    "segments": transcript_result["segments"],
+                    "style_config": style_config,
+                    "video_fps": int(video_info.get("fps", 30)),
+                    "video_info": video_info,
+                    "workflow_prefix": wf_prefix,
+                },
+                id=f"{workflow.info().workflow_id}/infographic-gen",
             )
 
         # ── G6b: Setup processors (face tracking, etc.) ──
@@ -307,12 +346,24 @@ class VideoEffectsWorkflow:
             heartbeat_timeout=timedelta(minutes=2),
         )
 
-        # Wait for render + MG plan in parallel
+        # Wait for render + MG plan + infographic gen in parallel
+        parallel_tasks = [render_task]
         if mg_plan_task is not None:
-            apply_result, mg_plan = await asyncio.gather(render_task, mg_plan_task)
-        else:
-            apply_result = await render_task
-            mg_plan = None
+            parallel_tasks.append(mg_plan_task)
+        if infographic_task is not None:
+            parallel_tasks.append(infographic_task)
+
+        results = await asyncio.gather(*parallel_tasks)
+        apply_result = results[0]
+
+        mg_plan = None
+        infographic_result = None
+        idx = 1
+        if mg_plan_task is not None:
+            mg_plan = results[idx]
+            idx += 1
+        if infographic_task is not None:
+            infographic_result = results[idx]
 
         # ── G7: Final composition + audio mux ──
         compose_result = await workflow.execute_activity(
@@ -328,6 +379,121 @@ class VideoEffectsWorkflow:
 
         base_output = compose_result["output_video"]
         mg_applied = 0
+
+        # ── Merge infographic components into MG plan ──
+        if infographic_result is not None:
+            gen_comps = infographic_result.get("generated_components", [])
+            fb_comps = infographic_result.get("fallback_components", [])
+            extra_components = gen_comps + fb_comps
+
+            if extra_components:
+                if mg_plan is None:
+                    mg_plan = {
+                        "components": [],
+                        "colorPalette": [],
+                        "includeBaseVideo": False,
+                        "faceDataPath": spatial_context.get("face_data_path", "") if spatial_context else "",
+                        "zoomStatePath": spatial_context.get("zoom_state_path", "") if spatial_context else "",
+                    }
+                    if style_config:
+                        mg_plan["styleConfig"] = style_config
+
+                mg_plan["components"] = mg_plan.get("components", []) + extra_components
+                workflow.logger.info(
+                    "Merged %d infographic components (%d generated, %d fallback)",
+                    len(extra_components), len(gen_comps), len(fb_comps),
+                )
+
+                # Re-validate merged plan (infographic overlap, face overlap, concurrency)
+                # Components here are still in time-domain (start_time/end_time seconds)
+                time_domain_comps = []
+                fps = int(video_info.get("fps", 30))
+                for c in mg_plan["components"]:
+                    if "start_time" in c:
+                        time_domain_comps.append(c)
+                    else:
+                        # Convert frame-domain back to time-domain for validation
+                        time_domain_comps.append({
+                            **c,
+                            "start_time": c["startFrame"] / fps,
+                            "end_time": (c["startFrame"] + c["durationInFrames"]) / fps,
+                        })
+
+                revalidation = await workflow.execute_activity(
+                    "vfx_validate_merged_plan",
+                    {
+                        "components": time_domain_comps,
+                        "spatial_context": spatial_context,
+                        "video_fps": fps,
+                    },
+                    start_to_close_timeout=activity_timeout,
+                )
+
+                # Convert validated components back to frame-domain
+                revalidated = []
+                for c in revalidation["components"]:
+                    start_frame = round(c.get("start_time", 0) * fps)
+                    end_frame = round(c.get("end_time", 0) * fps)
+                    dur_frames = max(1, end_frame - start_frame)
+                    revalidated.append({
+                        **{k: v for k, v in c.items() if k not in ("start_time", "end_time")},
+                        "startFrame": start_frame,
+                        "durationInFrames": dur_frames,
+                    })
+                mg_plan["components"] = revalidated
+
+                if revalidation.get("validation_issues"):
+                    workflow.logger.info(
+                        "Post-merge validation: %s", revalidation["validation_issues"]
+                    )
+
+        # ── Always inject subtitles from transcript ──
+        subtitle_segments = transcript_result.get("segments", [])
+        word_segments = [s for s in subtitle_segments if s.get("type") == "word" and s.get("text", "").strip()]
+        if word_segments:
+            fps = int(video_info.get("fps", 30))
+
+            # Build word list in frame-domain for the Subtitles component
+            subtitle_words = []
+            for seg in word_segments:
+                subtitle_words.append({
+                    "text": seg["text"],
+                    "startFrame": round(seg["start"] * fps),
+                    "endFrame": round(seg["end"] * fps),
+                })
+
+            # Single subtitle component spanning all speech
+            first_frame = subtitle_words[0]["startFrame"]
+            last_frame = subtitle_words[-1]["endFrame"]
+            subtitle_component = {
+                "template": "subtitles",
+                "startFrame": first_frame,
+                "durationInFrames": max(1, last_frame - first_frame),
+                "props": {
+                    "words": subtitle_words,
+                    "fontSize": 44,
+                },
+                "bounds": {"x": 0.1, "y": 0.82, "w": 0.8, "h": 0.14},
+                "zIndex": 100,  # Subtitles always on top
+                "anchor": "static",
+            }
+
+            if mg_plan is None:
+                mg_plan = {
+                    "components": [],
+                    "colorPalette": [],
+                    "includeBaseVideo": False,
+                    "faceDataPath": spatial_context.get("face_data_path", "") if spatial_context else "",
+                    "zoomStatePath": spatial_context.get("zoom_state_path", "") if spatial_context else "",
+                }
+                if style_config:
+                    mg_plan["styleConfig"] = style_config
+
+            mg_plan["components"].append(subtitle_component)
+            workflow.logger.info(
+                "Injected subtitles: %d words, frames %d-%d",
+                len(subtitle_words), first_frame, last_frame,
+            )
 
         # ── G8e + G9: Render overlay + composite (needs base video + approved plan) ──
         if mg_plan is not None and mg_plan.get("components"):
@@ -352,6 +518,7 @@ class VideoEffectsWorkflow:
     async def _plan_motion_graphics(
         self,
         *,
+        spatial_context: dict,
         video_info: dict,
         transcript: str,
         segments: list,
@@ -363,25 +530,13 @@ class VideoEffectsWorkflow:
         auto_approve: bool,
         activity_timeout: timedelta,
     ) -> dict | None:
-        """Run G8a-G8b: build context, LLM plan, approval loop.
+        """Run G8b: LLM plan, approval loop.
 
+        Spatial context (G8a) is now built externally and passed in.
         Returns approved composition plan dict, or None if skipped/rejected.
         Runs in parallel with G6b-G7 (no dependency on rendered video).
         """
         fps = int(video_info.get("fps", 30))
-
-        # ── G8a: Build Remotion context ──
-        spatial_context = await workflow.execute_activity(
-            "vfx_build_remotion_context",
-            {
-                "video_info": video_info,
-                "transcript": transcript,
-                "segments": segments,
-                "effects": effects,
-                "cache_dir": temp_dir,
-            },
-            start_to_close_timeout=activity_timeout,
-        )
 
         # ── G8b: LLM plan motion graphics (with approval loop) ──
         mg_feedback = ""

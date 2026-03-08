@@ -1,5 +1,6 @@
 import { spring, useCurrentFrame, useVideoConfig } from "remotion";
 import { useFaceFrame } from "./context";
+import { useZoomFrame } from "./zoom-context";
 import type { AnchorMode, FaceFrame, NormalizedRect } from "../types";
 
 interface Rect {
@@ -91,6 +92,24 @@ export function useFaceAvoidance(myBounds: NormalizedRect): {
   };
 }
 
+export function useZoomCompensation(
+  normX: number,
+  normY: number,
+): { adjustedX: number; adjustedY: number; adjustedScale: number } {
+  const { zoom, tx, ty } = useZoomFrame();
+  if (zoom <= 1.001)
+    return { adjustedX: normX, adjustedY: normY, adjustedScale: 1 };
+
+  // Replicate OpenCV affine: mapped_x = zoom * normX + (0.5 - tx * zoom)
+  const sx = 0.5 - tx * zoom;
+  const sy = 0.5 - ty * zoom;
+  return {
+    adjustedX: zoom * normX + sx,
+    adjustedY: zoom * normY + sy,
+    adjustedScale: zoom,
+  };
+}
+
 export function useFaceAwareLayout(
   staticBounds: NormalizedRect,
   anchor: AnchorMode = "static",
@@ -109,6 +128,10 @@ export function useFaceAwareLayout(
 
   const springProgress = spring({ frame, fps, durationInFrames: 15 });
 
+  let finalNormX: number;
+  let finalNormY: number;
+  let currentScale: number;
+
   // Fallback: static bounds with strengthened face avoidance + clamping
   if (!face || anchor === "static") {
     const { offsetX, offsetY } = useFaceAvoidanceRaw(
@@ -122,56 +145,59 @@ export function useFaceAwareLayout(
       compW,
       compH,
     );
-    return {
-      left: clamped.x * width,
-      top: clamped.y * height,
-      scale: face ? faceScale : 1,
-      maxWidth: (EDGE_MAX - clamped.x) * width,
-      maxHeight: (EDGE_MAX - clamped.y) * height,
-    };
-  }
-
-  let nx: number;
-  let ny: number;
-
-  if (anchor === "face-right") {
-    nx = face.cx + face.fw / 2 + PADDING;
-    ny = face.cy - compH / 2;
-  } else if (anchor === "face-left") {
-    nx = face.cx - face.fw / 2 - PADDING - compW;
-    ny = face.cy - compH / 2;
-  } else if (anchor === "face-below") {
-    nx = face.cx - compW / 2;
-    ny = face.cy + face.fh / 2 + PADDING;
-  } else if (anchor === "face-above") {
-    nx = face.cx - compW / 2;
-    ny = face.cy - face.fh / 2 - PADDING - compH;
+    finalNormX = clamped.x;
+    finalNormY = clamped.y;
+    currentScale = face ? faceScale : 1;
   } else {
-    // face-beside: pick the side with more room
-    const spaceRight = 1 - (face.cx + face.fw / 2);
-    const spaceLeft = face.cx - face.fw / 2;
-    if (spaceRight >= spaceLeft) {
+    let nx: number;
+    let ny: number;
+
+    if (anchor === "face-right") {
       nx = face.cx + face.fw / 2 + PADDING;
-    } else {
+      ny = face.cy - compH / 2;
+    } else if (anchor === "face-left") {
       nx = face.cx - face.fw / 2 - PADDING - compW;
+      ny = face.cy - compH / 2;
+    } else if (anchor === "face-below") {
+      nx = face.cx - compW / 2;
+      ny = face.cy + face.fh / 2 + PADDING;
+    } else if (anchor === "face-above") {
+      nx = face.cx - compW / 2;
+      ny = face.cy - face.fh / 2 - PADDING - compH;
+    } else {
+      // face-beside: pick the side with more room
+      const spaceRight = 1 - (face.cx + face.fw / 2);
+      const spaceLeft = face.cx - face.fw / 2;
+      if (spaceRight >= spaceLeft) {
+        nx = face.cx + face.fw / 2 + PADDING;
+      } else {
+        nx = face.cx - face.fw / 2 - PADDING - compW;
+      }
+      ny = face.cy - compH / 2;
     }
-    ny = face.cy - compH / 2;
+
+    const clamped = clampBounds(nx, ny, compW, compH);
+
+    // Animate from static bounds toward face-relative position
+    finalNormX =
+      staticBounds.x + (clamped.x - staticBounds.x) * springProgress;
+    finalNormY =
+      staticBounds.y + (clamped.y - staticBounds.y) * springProgress;
+    currentScale = faceScale;
   }
 
-  const clamped = clampBounds(nx, ny, compW, compH);
-
-  // Animate from static bounds toward face-relative position
-  const animatedX =
-    staticBounds.x + (clamped.x - staticBounds.x) * springProgress;
-  const animatedY =
-    staticBounds.y + (clamped.y - staticBounds.y) * springProgress;
+  // Apply zoom compensation so overlays track with zoomed content
+  const { adjustedX, adjustedY, adjustedScale } = useZoomCompensation(
+    finalNormX,
+    finalNormY,
+  );
 
   return {
-    left: animatedX * width,
-    top: animatedY * height,
-    scale: faceScale,
-    maxWidth: (EDGE_MAX - animatedX) * width,
-    maxHeight: (EDGE_MAX - animatedY) * height,
+    left: adjustedX * width,
+    top: adjustedY * height,
+    scale: currentScale * adjustedScale,
+    maxWidth: (EDGE_MAX - adjustedX) * width,
+    maxHeight: (EDGE_MAX - adjustedY) * height,
   };
 }
 

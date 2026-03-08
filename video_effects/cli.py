@@ -159,14 +159,19 @@ async def run_workflow(args) -> None:
     client = await get_client()
 
     workflow_id = f"vfx-{uuid.uuid4().hex[:8]}"
+    enable_infographics = getattr(args, "infographics", False)
+    # Infographics require motion graphics (they merge into the MG overlay)
+    enable_mg = args.motion_graphics or enable_infographics
+
     input_data = VideoEffectsInput(
         input_video=os.path.abspath(args.input),
         output_video=os.path.abspath(args.output),
         auto_approve=args.auto_approve,
-        enable_motion_graphics=args.motion_graphics,
+        enable_motion_graphics=enable_mg,
         style=args.style,
         dev_mode=args.dev,
         smooth_jump_cuts=args.smooth_cuts,
+        enable_infographics=enable_infographics,
     )
 
     print(f"Starting Video Effects workflow: {workflow_id}")
@@ -343,6 +348,11 @@ def main():
         "--smooth-cuts",
         action="store_true",
         help="Detect jump cuts and insert synthetic zoom transitions to smooth them",
+    )
+    run_parser.add_argument(
+        "--infographics",
+        action="store_true",
+        help="Enable LLM-generated infographic overlays (requires --motion-graphics)",
     )
 
     args = parser.parse_args()

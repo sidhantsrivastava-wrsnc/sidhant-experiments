@@ -41,12 +41,19 @@ export interface StyleConfig {
   font_weights: FontWeights;
 }
 
+export interface ZoomFrame {
+  zoom: number;     // current zoom level (1.0 = no zoom)
+  tx: number;       // target X normalized (0-1)
+  ty: number;       // target Y normalized (0-1)
+}
+
 export interface CompositionPlan {
   components: ComponentSpec[];
   colorPalette: string[];
   includeBaseVideo: boolean;
   baseVideoPath?: string;
   faceDataPath?: string;
+  zoomStatePath?: string;
   styleConfig?: StyleConfig;
   /** Passed from Python to size the composition dynamically. */
   durationInFrames?: number;
@@ -86,6 +93,22 @@ export interface ListicleProps {
   fontSize?: number;
   color?: string;
   accentColor?: string;
+}
+
+export interface SubtitleWord {
+  text: string;
+  startFrame: number;
+  endFrame: number;
+}
+
+export interface SubtitlesProps {
+  words: SubtitleWord[];
+  position: NormalizedRect;
+  anchor?: AnchorMode;
+  fontSize?: number;
+  color?: string;
+  highlightColor?: string;
+  backgroundColor?: string;
 }
 
 export interface DataAnimationProps {

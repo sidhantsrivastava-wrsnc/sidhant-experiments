@@ -113,6 +113,13 @@ def detect_faces(
     total_infer = 0
     last_ts_ms = -1
 
+    # Clamp ranges to valid frame indices
+    active_ranges = [
+        (max(0, s), min(e, total_frames - 1))
+        for s, e in active_ranges
+        if s < total_frames
+    ]
+
     for rng_start, rng_end in active_ranges:
         n_frames = rng_end - rng_start + 1
         t_start = rng_start / fps

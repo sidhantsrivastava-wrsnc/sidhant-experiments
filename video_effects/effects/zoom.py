@@ -9,6 +9,176 @@ from video_effects.effects.base import BaseEffect, EffectContext
 from video_effects.schemas.effects import EffectCue, VideoInfo
 
 
+def export_zoom_state(
+    effects: list[dict],
+    face_data: list | None,
+    total_frames: int,
+    fps: float,
+    width: int,
+    height: int,
+    output_path: str,
+) -> str:
+    """Pre-compute per-frame [zoomLevel, targetNormX, targetNormY] and write to JSON.
+
+    Output format: {"frames": {<frame_idx>: [zoom, tx_norm, ty_norm], ...}}
+    Only includes frames where zoom != 1.0 (sparse).
+    """
+    zoom_cues = [e for e in effects if e.get("effect_type") == "zoom"]
+    if not zoom_cues:
+        return ""
+
+    # Build hold intervals (same logic as ZoomEffect._build_hold_intervals)
+    sorted_cues = sorted(zoom_cues, key=lambda c: c.get("start_time", 0))
+    hold_intervals: list[tuple[float, float, float, str]] = []
+    pending_in = None
+    for cue in sorted_cues:
+        params = cue.get("zoom_params", {})
+        action = params.get("action", "bounce")
+        if action == "in":
+            pending_in = cue
+        elif action == "out" and pending_in is not None:
+            p_end = pending_in.get("end_time", 0)
+            c_start = cue.get("start_time", 0)
+            if p_end < c_start:
+                hold_intervals.append((
+                    p_end, c_start,
+                    pending_in.get("zoom_params", {}).get("zoom_level", 1.5),
+                    pending_in.get("zoom_params", {}).get("tracking", "center"),
+                ))
+            pending_in = None
+
+    frames_dict: dict[str, list[float]] = {}
+
+    # Dampened face tracking state
+    damp_fx, damp_fy = float(width) / 2, float(height) / 2
+    damp_initialized = False
+
+    for frame_idx in range(total_frames):
+        timestamp = frame_idx / fps
+        current_zoom = 1.0
+        tx, ty = float(width) / 2, float(height) / 2
+
+        # Check hold intervals
+        in_hold = False
+        for hold_start, hold_end, hold_zoom, hold_tracking in hold_intervals:
+            if hold_start <= timestamp <= hold_end:
+                current_zoom = hold_zoom
+                if hold_tracking == "face" and face_data and frame_idx < len(face_data):
+                    fd = face_data[frame_idx]
+                    fx, fy = float(fd[0]), float(fd[1])
+                    dampen = 1.0 / max(hold_zoom, 1.001)
+                    if not damp_initialized:
+                        damp_fx, damp_fy = fx, fy
+                        damp_initialized = True
+                    else:
+                        damp_fx = dampen * fx + (1.0 - dampen) * damp_fx
+                        damp_fy = dampen * fy + (1.0 - dampen) * damp_fy
+                    tx, ty = damp_fx, damp_fy
+                in_hold = True
+                break
+
+        if not in_hold:
+            # Check active zoom cues
+            for cue in zoom_cues:
+                cue_start = cue.get("start_time", 0)
+                cue_end = cue.get("end_time", 0)
+                if not (cue_start <= timestamp <= cue_end):
+                    continue
+
+                params = cue.get("zoom_params", {})
+                z = params.get("zoom_level", 1.5)
+                duration = cue_end - cue_start
+                progress = (timestamp - cue_start) / duration if duration > 0 else 1.0
+
+                action = params.get("action", "bounce")
+                easing = params.get("easing", "smooth")
+                if action == "in":
+                    intensity = _ease_in_standalone(progress, easing)
+                elif action == "out":
+                    intensity = _ease_out_standalone(progress, easing)
+                else:
+                    intensity = _ease_bounce_standalone(progress, easing)
+
+                current_zoom = 1.0 + (z - 1.0) * intensity
+
+                tracking = params.get("tracking", "center")
+                if tracking == "face" and face_data and frame_idx < len(face_data):
+                    fd = face_data[frame_idx]
+                    fx, fy = float(fd[0]), float(fd[1])
+                    dampen = 1.0 / max(current_zoom, 1.001)
+                    if not damp_initialized:
+                        damp_fx, damp_fy = fx, fy
+                        damp_initialized = True
+                    else:
+                        damp_fx = dampen * fx + (1.0 - dampen) * damp_fx
+                        damp_fy = dampen * fy + (1.0 - dampen) * damp_fy
+                    # Lerp between center and face position
+                    tx = width / 2 + (damp_fx - width / 2) * intensity
+                    ty = height / 2 + (damp_fy - height / 2) * intensity
+                break  # Only apply first matching cue
+
+        if current_zoom > 1.001:
+            tx_norm = tx / width
+            ty_norm = ty / height
+            frames_dict[str(frame_idx)] = [
+                round(current_zoom, 4),
+                round(tx_norm, 4),
+                round(ty_norm, 4),
+            ]
+
+    if not frames_dict:
+        return ""
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump({"frames": frames_dict}, f)
+
+    return output_path
+
+
+def _ease_bounce_standalone(t: float, easing: str) -> float:
+    t = max(0.0, min(1.0, t))
+    if easing == "snap":
+        if t < 0.25:
+            return (t / 0.25) ** 2
+        elif t > 0.75:
+            r = (t - 0.75) / 0.25
+            return 1.0 - r ** 2
+        return 1.0
+    elif easing == "overshoot":
+        base = math.sin(math.pi * t)
+        overshoot = 0.15 * math.sin(2.0 * math.pi * t)
+        return max(0.0, min(1.15, base + overshoot))
+    else:
+        return math.sin(math.pi * t)
+
+
+def _ease_in_standalone(t: float, easing: str) -> float:
+    t = max(0.0, min(1.0, t))
+    if easing == "snap":
+        if t < 0.5:
+            return (t / 0.5) ** 2
+        return 1.0
+    elif easing == "overshoot":
+        base = math.sin(math.pi / 2 * t)
+        overshoot = 0.15 * math.sin(math.pi * t)
+        return max(0.0, min(1.15, base + overshoot))
+    else:
+        return math.sin(math.pi / 2 * t)
+
+
+def _ease_out_standalone(t: float, easing: str) -> float:
+    t = max(0.0, min(1.0, t))
+    if easing == "snap":
+        return max(0.0, 1.0 - t ** 2)
+    elif easing == "overshoot":
+        base = math.cos(math.pi / 2 * t)
+        undershoot = -0.15 * math.sin(math.pi * t)
+        return max(0.0, min(1.15, base + undershoot))
+    else:
+        return math.cos(math.pi / 2 * t)
+
+
 class ZoomEffect(BaseEffect):
     """Zoom effect with face-tracked, center, or point tracking."""
 

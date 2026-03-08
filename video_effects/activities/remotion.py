@@ -296,6 +296,24 @@ def build_remotion_context(input_data: dict) -> dict:
                 "safe_regions": safe_regions,
             })
 
+    # Export per-frame zoom state for Remotion zoom compensation
+    zoom_state_path = ""
+    zoom_effects = [e for e in effects if e.get("effect_type") == "zoom"]
+    if zoom_effects:
+        from video_effects.effects.zoom import export_zoom_state
+        zoom_state_output = os.path.join(cache_dir, "zoom_state.json")
+        zoom_state_path = export_zoom_state(
+            effects=effects,
+            face_data=face_data,
+            total_frames=total_frames,
+            fps=fps,
+            width=width,
+            height=height,
+            output_path=zoom_state_output,
+        )
+        if zoom_state_path:
+            logger.info("Exported zoom state to %s", zoom_state_path)
+
     context = {
         "video": {
             "width": width,
@@ -311,6 +329,7 @@ def build_remotion_context(input_data: dict) -> dict:
         "face_windows": face_windows,
         "opencv_effects": effects,
         "face_data_path": face_data_path if face_data else "",
+        "zoom_state_path": zoom_state_path,
     }
 
     logger.info(
@@ -386,10 +405,12 @@ def plan_motion_graphics(input_data: dict) -> dict:
         lines.append("Please adjust your plan based on this feedback.\n")
 
     video = context.get("video", {})
+    vid_duration = video.get('duration', 0)
     lines.append(f"## Video Info")
     lines.append(f"- Resolution: {video.get('width', '?')}x{video.get('height', '?')}")
-    lines.append(f"- Duration: {video.get('duration', 0):.1f}s")
-    lines.append(f"- FPS: {video.get('fps', 30)}\n")
+    lines.append(f"- Duration: {vid_duration:.1f}s")
+    lines.append(f"- FPS: {video.get('fps', 30)}")
+    lines.append(f"- **All component times must be between 0.0 and {vid_duration:.1f}s**\n")
 
     if style_hint:
         lines.append(f"## Style Preference\n{style_hint}\n")
@@ -474,6 +495,7 @@ def plan_motion_graphics(input_data: dict) -> dict:
         "colorPalette": raw_plan.get("color_palette", []),
         "includeBaseVideo": False,
         "faceDataPath": context.get("face_data_path", ""),
+        "zoomStatePath": context.get("zoom_state_path", ""),
     }
 
     if style_config:
@@ -484,6 +506,45 @@ def plan_motion_graphics(input_data: dict) -> dict:
         "raw_plan": raw_plan,
         "validation_issues": issues,
     }
+
+
+def _rect_overlap_fraction(a: dict, b: dict) -> float:
+    """Compute overlap area between two normalized rects as fraction of a's area."""
+    ax, ay, aw, ah = a.get("x", 0), a.get("y", 0), a.get("w", 0), a.get("h", 0)
+    bx, by, bw, bh = b.get("x", 0), b.get("y", 0), b.get("w", 0), b.get("h", 0)
+    a_area = aw * ah
+    if a_area <= 0:
+        return 0.0
+    ox = max(0, min(ax + aw, bx + bw) - max(ax, bx))
+    oy = max(0, min(ay + ah, by + bh) - max(ay, by))
+    return (ox * oy) / a_area
+
+
+def _find_best_safe_region(
+    comp_w: float, comp_h: float, safe_regions: list[dict]
+) -> tuple[float, float, float, float] | None:
+    """Pick the safe region with most area that fits the component.
+
+    Returns (x, y, w, h) centered within the chosen region, or None.
+    """
+    # First try regions that fit the component as-is
+    fitting = [r for r in safe_regions if r.get("w", 0) >= comp_w and r.get("h", 0) >= comp_h]
+    if fitting:
+        best = max(fitting, key=lambda r: r.get("w", 0) * r.get("h", 0))
+        cx = best["x"] + (best["w"] - comp_w) / 2
+        cy = best["y"] + (best["h"] - comp_h) / 2
+        return cx, cy, comp_w, comp_h
+
+    # No region fits — pick the largest and shrink component to fit
+    if safe_regions:
+        best = max(safe_regions, key=lambda r: r.get("w", 0) * r.get("h", 0))
+        new_w = min(comp_w, best.get("w", comp_w))
+        new_h = min(comp_h, best.get("h", comp_h))
+        cx = best["x"] + (best["w"] - new_w) / 2
+        cy = best["y"] + (best["h"] - new_h) / 2
+        return cx, cy, new_w, new_h
+
+    return None
 
 
 def _validate_plan(
@@ -544,6 +605,43 @@ def _validate_plan(
         if comp["end_time"] <= comp["start_time"]:
             comp["end_time"] = comp["start_time"] + 0.5
 
+    # Enforce template duration limits
+    for comp in components:
+        template_spec = MG_TEMPLATE_REGISTRY.get(comp.get("template", ""))
+        if template_spec:
+            max_dur = template_spec.duration_range[1]
+            actual_dur = comp["end_time"] - comp["start_time"]
+            if actual_dur > max_dur:
+                issues.append(
+                    f"Clamped {comp['template']} duration from {actual_dur:.1f}s to {max_dur:.1f}s"
+                )
+                comp["end_time"] = comp["start_time"] + max_dur
+
+    # Face overlap relocation — move components away from speaker's face
+    face_windows = context.get("face_windows", [])
+    for comp in components:
+        bounds = comp.get("bounds", {})
+        bx, by, bw, bh = bounds.get("x", 0), bounds.get("y", 0), bounds.get("w", 0.2), bounds.get("h", 0.1)
+        for fw in face_windows:
+            # Check time overlap
+            if comp["start_time"] >= fw.get("end_time", 0) or fw.get("start_time", 0) >= comp["end_time"]:
+                continue
+            face_region = fw.get("face_region", {})
+            overlap = _rect_overlap_fraction(bounds, face_region)
+            if overlap > 0.05:
+                safe_regions = fw.get("safe_regions", [])
+                result = _find_best_safe_region(bw, bh, safe_regions)
+                if result:
+                    new_x, new_y, new_w, new_h = result
+                    bounds["x"] = round(new_x, 3)
+                    bounds["y"] = round(new_y, 3)
+                    bounds["w"] = round(new_w, 3)
+                    bounds["h"] = round(new_h, 3)
+                    issues.append(
+                        f"Relocated {comp.get('template', '?')} away from face at {comp['start_time']:.1f}s"
+                    )
+                break  # Only need to relocate once per component
+
     # Check max 2 concurrent (excluding edge-aligned templates like progress_bar)
     edge_aligned_templates = {
         name for name, spec in MG_TEMPLATE_REGISTRY.items()
@@ -572,6 +670,46 @@ def _validate_plan(
     if to_remove:
         dropped = {id(non_bar[i]) for i in to_remove}
         components = [c for c in components if id(c) not in dropped]
+
+    # Spatial overlap shifting — resolve overlapping concurrent components
+    non_edge = [c for c in components if c.get("template", "") not in edge_aligned_templates]
+    for i, a in enumerate(non_edge):
+        for j, b in enumerate(non_edge):
+            if j <= i:
+                continue
+            # Check time overlap
+            if a["start_time"] >= b["end_time"] or b["start_time"] >= a["end_time"]:
+                continue
+            ab = a.get("bounds", {})
+            bb = b.get("bounds", {})
+            overlap = _rect_overlap_fraction(ab, bb)
+            if overlap <= 0.10:
+                continue
+            # Shift the lower z_index component
+            if a.get("z_index", 0) <= b.get("z_index", 0):
+                target, other_bounds = a, bb
+            else:
+                target, other_bounds = b, ab
+            tb = target.get("bounds", {})
+            ob_bottom = other_bounds.get("y", 0) + other_bounds.get("h", 0)
+            ob_top = other_bounds.get("y", 0)
+            # Try below the other component
+            if ob_bottom + tb.get("h", 0.1) <= 0.98:
+                tb["y"] = round(ob_bottom + 0.02, 3)
+            # Try above
+            elif ob_top - tb.get("h", 0.1) >= 0.02:
+                tb["y"] = round(ob_top - tb.get("h", 0.1) - 0.02, 3)
+            # Try opposite horizontal side
+            else:
+                ob_right = other_bounds.get("x", 0) + other_bounds.get("w", 0)
+                if ob_right + tb.get("w", 0.2) <= 0.98:
+                    tb["x"] = round(ob_right + 0.02, 3)
+                elif other_bounds.get("x", 0) - tb.get("w", 0.2) >= 0.02:
+                    tb["x"] = round(other_bounds.get("x", 0) - tb.get("w", 0.2) - 0.02, 3)
+            issues.append(
+                f"Shifted {target.get('template', '?')} to avoid overlap with "
+                f"{(a if target is b else b).get('template', '?')}"
+            )
 
     # Check zoom viewport coordination
     zoom_effects = [
@@ -604,8 +742,77 @@ def _validate_plan(
                     if bounds["y"] + bh > 1 - margin:
                         bounds["h"] = max(0.05, 1 - margin - bounds["y"] - 0.02)
 
+    # Zoom transition buffer — shift overlays away from zoom ease-in/ease-out
+    for comp in components:
+        for ze in zoom_effects:
+            if comp["start_time"] >= ze.get("end_time", 0) or ze.get("start_time", 0) >= comp["end_time"]:
+                continue
+            stable_start, stable_end = _compute_zoom_stable_window(ze)
+            stable_dur = stable_end - stable_start
+            comp_dur = comp["end_time"] - comp["start_time"]
+
+            # If overlay starts during zoom transition, delay it to stable window
+            if comp["start_time"] < stable_start and comp["end_time"] > stable_start:
+                comp["start_time"] = stable_start
+                issues.append(f"Delayed {comp['template']} to avoid zoom transition")
+
+            # If overlay ends during zoom transition, end it before transition
+            if comp["end_time"] > stable_end and comp["start_time"] < stable_end:
+                comp["end_time"] = stable_end
+                issues.append(f"Trimmed {comp['template']} to avoid zoom transition")
+
+            # If component is entirely during transition (stable window too short), shift outside zoom
+            if stable_dur < 1.0 or comp_dur > stable_dur:
+                comp["start_time"] = ze.get("end_time", 0) + 0.1
+                comp["end_time"] = comp["start_time"] + comp_dur
+                issues.append(f"Shifted {comp['template']} past zoom (transition window too short)")
+
     logger.info("Validation: %d components kept, %d issues", len(components), len(issues))
     return components, issues
+
+
+def _compute_zoom_stable_window(zoom_cue: dict) -> tuple[float, float]:
+    """Return the time range where zoom is stable (not actively transitioning)."""
+    start = zoom_cue.get("start_time", 0)
+    end = zoom_cue.get("end_time", 0)
+    dur = end - start
+    if dur <= 0:
+        return start, end
+    params = zoom_cue.get("zoom_params", {})
+    action = params.get("action", "bounce")
+    if action == "bounce":
+        # sin(pi*t): peaks ~0.3-0.7 range, transitions on edges
+        return start + dur * 0.25, start + dur * 0.75
+    elif action == "in":
+        # Ramps up, stable at end
+        return start + dur * 0.6, end
+    elif action == "out":
+        # Starts zoomed, ramps down
+        return start, start + dur * 0.4
+    return start, end
+
+
+@activity.defn(name="vfx_validate_merged_plan")
+def validate_merged_plan(input_data: dict) -> dict:
+    """Re-validate after merging infographic + MG components.
+
+    Input: {
+        "components": list[dict],      # merged components (time-domain, not frame-domain)
+        "spatial_context": dict,        # output of G8a
+        "video_fps": int,
+    }
+    Output: {
+        "components": list[dict],
+        "validation_issues": list[str],
+    }
+    """
+    components = input_data["components"]
+    context = input_data["spatial_context"]
+    fps = input_data.get("video_fps", 30)
+    validated, issues = _validate_plan(components, context, fps)
+    if issues:
+        logger.info("Post-merge validation: %s", issues)
+    return {"components": validated, "validation_issues": issues}
 
 
 @activity.defn(name="vfx_load_composition_plan")

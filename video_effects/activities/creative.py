@@ -74,6 +74,16 @@ def design_style(input_data: dict) -> dict:
         if key in base_config:
             if key == "font_weights" and isinstance(value, dict):
                 base_config["font_weights"].update(value)
+            elif key == "palette" and isinstance(value, dict):
+                # LLM may return palette as {"accent": "#FF4040", ...}
+                # Map named keys onto the base list [text, secondary, accent]
+                palette = list(base_config["palette"])  # copy base
+                key_map = {"text": 0, "secondary": 1, "accent": 2}
+                for pkey, pval in value.items():
+                    idx = key_map.get(pkey)
+                    if idx is not None and isinstance(pval, str) and pval.startswith("#"):
+                        palette[idx] = pval
+                base_config["palette"] = palette
             else:
                 base_config[key] = value
 

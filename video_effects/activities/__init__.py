@@ -7,12 +7,20 @@ from .compose import compose_final
 from .remotion import (
     build_remotion_context,
     plan_motion_graphics,
+    validate_merged_plan,
     load_composition_plan,
     render_motion_overlay,
     composite_motion_graphics,
     preview_motion_graphics,
 )
 from .detect_jump_cuts import detect_jump_cuts
+from .infographic import (
+    cleanup_generated,
+    plan_infographics,
+    generate_infographic_code,
+    validate_infographic,
+    build_generated_registry,
+)
 
 ALL_VIDEO_EFFECTS_ACTIVITIES = [
     get_video_info,
@@ -27,9 +35,15 @@ ALL_VIDEO_EFFECTS_ACTIVITIES = [
     compose_final,
     build_remotion_context,
     plan_motion_graphics,
+    validate_merged_plan,
     load_composition_plan,
     render_motion_overlay,
     composite_motion_graphics,
     preview_motion_graphics,
     detect_jump_cuts,
+    cleanup_generated,
+    plan_infographics,
+    generate_infographic_code,
+    validate_infographic,
+    build_generated_registry,
 ]

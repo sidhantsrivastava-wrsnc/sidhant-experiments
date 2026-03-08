@@ -8,10 +8,11 @@ import {
   delayRender,
 } from "remotion";
 import { FaceDataProvider } from "./lib/context";
+import { ZoomDataProvider } from "./lib/zoom-context";
 import { loadStyleFont } from "./lib/fonts";
 import { StyleProvider } from "./lib/styles";
 import { ComponentRegistry } from "./components";
-import type { CompositionPlan, FaceFrame, StyleConfig } from "./types";
+import type { CompositionPlan, FaceFrame, StyleConfig, ZoomFrame } from "./types";
 
 export const DynamicComposition: React.FC<CompositionPlan> = ({
   components,
@@ -19,13 +20,23 @@ export const DynamicComposition: React.FC<CompositionPlan> = ({
   includeBaseVideo,
   baseVideoPath,
   faceDataPath,
+  zoomStatePath,
   styleConfig,
 }) => {
   const [faceData, setFaceData] = useState<FaceFrame[]>([]);
+  const [zoomData, setZoomData] = useState<Map<number, ZoomFrame>>(new Map());
   const [handle] = useState(() => delayRender());
 
   useEffect(() => {
+    let pending = 0;
+    const maybeFinish = () => {
+      pending--;
+      if (pending <= 0) continueRender(handle);
+    };
+
+    // Load face data
     if (faceDataPath) {
+      pending++;
       fetch(faceDataPath)
         .then((r) => r.json())
         .then((data: number[][]) => {
@@ -36,15 +47,29 @@ export const DynamicComposition: React.FC<CompositionPlan> = ({
             fh: d[3],
           }));
           setFaceData(frames);
-          continueRender(handle);
+          maybeFinish();
         })
-        .catch(() => {
-          continueRender(handle);
-        });
-    } else {
-      continueRender(handle);
+        .catch(() => maybeFinish());
     }
-  }, [faceDataPath, handle]);
+
+    // Load zoom state
+    if (zoomStatePath) {
+      pending++;
+      fetch(zoomStatePath)
+        .then((r) => r.json())
+        .then((data: { frames: Record<string, number[]> }) => {
+          const map = new Map<number, ZoomFrame>();
+          for (const [key, val] of Object.entries(data.frames)) {
+            map.set(Number(key), { zoom: val[0], tx: val[1], ty: val[2] });
+          }
+          setZoomData(map);
+          maybeFinish();
+        })
+        .catch(() => maybeFinish());
+    }
+
+    if (pending === 0) continueRender(handle);
+  }, [faceDataPath, zoomStatePath, handle]);
 
   // Resolve font and build final style config
   const resolvedStyle = React.useMemo<StyleConfig | undefined>(() => {
@@ -64,24 +89,26 @@ export const DynamicComposition: React.FC<CompositionPlan> = ({
   return (
     <StyleProvider styleConfig={resolvedStyle}>
       <FaceDataProvider faceData={faceData}>
-        <AbsoluteFill style={{ backgroundColor: "transparent" }}>
-          {includeBaseVideo && baseVideoPath && (
-            <OffthreadVideo src={baseVideoPath} />
-          )}
-          {sorted.map((comp, i) => {
-            const Component = ComponentRegistry[comp.template];
-            if (!Component) return null;
-            return (
-              <Sequence
-                key={i}
-                from={comp.startFrame}
-                durationInFrames={comp.durationInFrames}
-              >
-                <Component {...comp.props} position={comp.bounds} anchor={comp.anchor} />
-              </Sequence>
-            );
-          })}
-        </AbsoluteFill>
+        <ZoomDataProvider zoomData={zoomData}>
+          <AbsoluteFill style={{ backgroundColor: "transparent" }}>
+            {includeBaseVideo && baseVideoPath && (
+              <OffthreadVideo src={baseVideoPath} />
+            )}
+            {sorted.map((comp, i) => {
+              const Component = ComponentRegistry[comp.template];
+              if (!Component) return null;
+              return (
+                <Sequence
+                  key={i}
+                  from={comp.startFrame}
+                  durationInFrames={comp.durationInFrames}
+                >
+                  <Component {...comp.props} position={comp.bounds} anchor={comp.anchor} />
+                </Sequence>
+              );
+            })}
+          </AbsoluteFill>
+        </ZoomDataProvider>
       </FaceDataProvider>
     </StyleProvider>
   );
