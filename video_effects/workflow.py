@@ -465,6 +465,11 @@ class VideoEffectsWorkflow:
             # Single subtitle component spanning all speech
             first_frame = subtitle_words[0]["startFrame"]
             last_frame = subtitle_words[-1]["endFrame"]
+
+            # Convert to Sequence-relative frames (useCurrentFrame() returns 0 at Sequence start)
+            for w in subtitle_words:
+                w["startFrame"] = w["startFrame"] - first_frame
+                w["endFrame"] = w["endFrame"] - first_frame
             subtitle_component = {
                 "template": "subtitles",
                 "startFrame": first_frame,
@@ -473,7 +478,7 @@ class VideoEffectsWorkflow:
                     "words": subtitle_words,
                     "fontSize": 44,
                 },
-                "bounds": {"x": 0.1, "y": 0.82, "w": 0.8, "h": 0.14},
+                "bounds": {"x": 0.1, "y": 0.78, "w": 0.8, "h": 0.16},
                 "zIndex": 100,  # Subtitles always on top
                 "anchor": "static",
             }

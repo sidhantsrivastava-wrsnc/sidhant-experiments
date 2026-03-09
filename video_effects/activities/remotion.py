@@ -547,131 +547,13 @@ def _find_best_safe_region(
     return None
 
 
-def _validate_plan(
+def _resolve_spatial_conflicts(
     components: list[dict],
-    context: dict,
-    fps: float,
-) -> tuple[list[dict], list[str]]:
-    """Validate and fix motion graphics plan.
-
-    Rules:
-    1. Max 2 concurrent components (drop lowest z_index if exceeded)
-    2. No spatial overlap between simultaneous components
-    3. Zoom viewport: components during zoom must be within inner frame
-    """
-    issues: list[str] = []
-    if not components:
-        return components, issues
-
-    duration = context.get("video", {}).get("duration", 999)
-
-    # Hard bounds clamping — keep components within safe frame
-    for comp in components:
-        bounds = comp.get("bounds", {})
-        bx = bounds.get("x", 0.1)
-        by = bounds.get("y", 0.1)
-        bw = bounds.get("w", 0.2)
-        bh = bounds.get("h", 0.1)
-
-        # Ensure minimum dimensions
-        bw = max(bw, 0.05)
-        bh = max(bh, 0.03)
-
-        # Clamp origin to safe range
-        bx = max(0.02, min(bx, 0.98))
-        by = max(0.02, min(by, 0.98))
-
-        # Clamp right/bottom edges
-        if bx + bw > 0.98:
-            bw = 0.98 - bx
-        if by + bh > 0.98:
-            bh = 0.98 - by
-
-        if (bx, by, bw, bh) != (bounds.get("x"), bounds.get("y"), bounds.get("w"), bounds.get("h")):
-            issues.append(f"Clamped {comp.get('template', '?')} bounds to safe frame")
-
-        bounds["x"] = bx
-        bounds["y"] = by
-        bounds["w"] = bw
-        bounds["h"] = bh
-
-    # Clamp times to video duration
-    for comp in components:
-        if comp["end_time"] > duration:
-            issues.append(f"Clamped {comp['template']} end_time from {comp['end_time']:.1f} to {duration:.1f}")
-            comp["end_time"] = duration
-        if comp["start_time"] < 0:
-            comp["start_time"] = 0
-        if comp["end_time"] <= comp["start_time"]:
-            comp["end_time"] = comp["start_time"] + 0.5
-
-    # Enforce template duration limits
-    for comp in components:
-        template_spec = MG_TEMPLATE_REGISTRY.get(comp.get("template", ""))
-        if template_spec:
-            max_dur = template_spec.duration_range[1]
-            actual_dur = comp["end_time"] - comp["start_time"]
-            if actual_dur > max_dur:
-                issues.append(
-                    f"Clamped {comp['template']} duration from {actual_dur:.1f}s to {max_dur:.1f}s"
-                )
-                comp["end_time"] = comp["start_time"] + max_dur
-
-    # Face overlap relocation — move components away from speaker's face
-    face_windows = context.get("face_windows", [])
-    for comp in components:
-        bounds = comp.get("bounds", {})
-        bx, by, bw, bh = bounds.get("x", 0), bounds.get("y", 0), bounds.get("w", 0.2), bounds.get("h", 0.1)
-        for fw in face_windows:
-            # Check time overlap
-            if comp["start_time"] >= fw.get("end_time", 0) or fw.get("start_time", 0) >= comp["end_time"]:
-                continue
-            face_region = fw.get("face_region", {})
-            overlap = _rect_overlap_fraction(bounds, face_region)
-            if overlap > 0.05:
-                safe_regions = fw.get("safe_regions", [])
-                result = _find_best_safe_region(bw, bh, safe_regions)
-                if result:
-                    new_x, new_y, new_w, new_h = result
-                    bounds["x"] = round(new_x, 3)
-                    bounds["y"] = round(new_y, 3)
-                    bounds["w"] = round(new_w, 3)
-                    bounds["h"] = round(new_h, 3)
-                    issues.append(
-                        f"Relocated {comp.get('template', '?')} away from face at {comp['start_time']:.1f}s"
-                    )
-                break  # Only need to relocate once per component
-
-    # Check max 2 concurrent (excluding edge-aligned templates like progress_bar)
-    edge_aligned_templates = {
-        name for name, spec in MG_TEMPLATE_REGISTRY.items()
-        if spec.spatial.edge_aligned
-    }
-    non_bar = [c for c in components if c["template"] not in edge_aligned_templates]
-    to_remove = set()
-    for i, a in enumerate(non_bar):
-        concurrent = []
-        for j, b in enumerate(non_bar):
-            if i == j:
-                continue
-            if a["start_time"] < b["end_time"] and b["start_time"] < a["end_time"]:
-                concurrent.append(j)
-        if len(concurrent) >= 2:
-            # Too many concurrent — drop lowest z_index among concurrent
-            candidates = sorted(concurrent, key=lambda j: non_bar[j].get("z_index", 0))
-            drop_idx = candidates[0]
-            if drop_idx not in to_remove:
-                to_remove.add(drop_idx)
-                issues.append(
-                    f"Dropped {non_bar[drop_idx]['template']} at {non_bar[drop_idx]['start_time']:.1f}s "
-                    f"(>2 concurrent)"
-                )
-
-    if to_remove:
-        dropped = {id(non_bar[i]) for i in to_remove}
-        components = [c for c in components if id(c) not in dropped]
-
-    # Spatial overlap shifting — resolve overlapping concurrent components
+    edge_aligned_templates: set[str],
+    issues: list[str],
+) -> bool:
+    """Single pass of spatial overlap resolution. Returns True if any component was moved."""
+    changed = False
     non_edge = [c for c in components if c.get("template", "") not in edge_aligned_templates]
     for i, a in enumerate(non_edge):
         for j, b in enumerate(non_edge):
@@ -706,12 +588,144 @@ def _validate_plan(
                     tb["x"] = round(ob_right + 0.02, 3)
                 elif other_bounds.get("x", 0) - tb.get("w", 0.2) >= 0.02:
                     tb["x"] = round(other_bounds.get("x", 0) - tb.get("w", 0.2) - 0.02, 3)
+            changed = True
             issues.append(
                 f"Shifted {target.get('template', '?')} to avoid overlap with "
                 f"{(a if target is b else b).get('template', '?')}"
             )
+    return changed
 
-    # Check zoom viewport coordination
+
+def _validate_plan(
+    components: list[dict],
+    context: dict,
+    fps: float,
+) -> tuple[list[dict], list[str]]:
+    """Validate and fix motion graphics plan.
+
+    Rules:
+    1. Hard bounds clamping
+    2. Time clamping
+    3. Template duration limits
+    4. Face overlap relocation
+    5. Concurrent count enforcement
+    6. Zoom viewport clamping
+    7. Zoom transition buffer
+    8. Multi-pass spatial conflict resolution (runs last, catches all accumulated conflicts)
+    """
+    issues: list[str] = []
+    if not components:
+        return components, issues
+
+    duration = context.get("video", {}).get("duration", 999)
+
+    # 1. Hard bounds clamping — keep components within safe frame
+    for comp in components:
+        bounds = comp.get("bounds", {})
+        bx = bounds.get("x", 0.1)
+        by = bounds.get("y", 0.1)
+        bw = bounds.get("w", 0.2)
+        bh = bounds.get("h", 0.1)
+
+        # Ensure minimum dimensions
+        bw = max(bw, 0.05)
+        bh = max(bh, 0.03)
+
+        # Clamp origin to safe range
+        bx = max(0.02, min(bx, 0.98))
+        by = max(0.02, min(by, 0.98))
+
+        # Clamp right/bottom edges
+        if bx + bw > 0.98:
+            bw = 0.98 - bx
+        if by + bh > 0.98:
+            bh = 0.98 - by
+
+        if (bx, by, bw, bh) != (bounds.get("x"), bounds.get("y"), bounds.get("w"), bounds.get("h")):
+            issues.append(f"Clamped {comp.get('template', '?')} bounds to safe frame")
+
+        bounds["x"] = bx
+        bounds["y"] = by
+        bounds["w"] = bw
+        bounds["h"] = bh
+
+    # 2. Clamp times to video duration
+    for comp in components:
+        if comp["end_time"] > duration:
+            issues.append(f"Clamped {comp['template']} end_time from {comp['end_time']:.1f} to {duration:.1f}")
+            comp["end_time"] = duration
+        if comp["start_time"] < 0:
+            comp["start_time"] = 0
+        if comp["end_time"] <= comp["start_time"]:
+            comp["end_time"] = comp["start_time"] + 0.5
+
+    # 3. Enforce template duration limits
+    for comp in components:
+        template_spec = MG_TEMPLATE_REGISTRY.get(comp.get("template", ""))
+        if template_spec:
+            max_dur = template_spec.duration_range[1]
+            actual_dur = comp["end_time"] - comp["start_time"]
+            if actual_dur > max_dur:
+                issues.append(
+                    f"Clamped {comp['template']} duration from {actual_dur:.1f}s to {max_dur:.1f}s"
+                )
+                comp["end_time"] = comp["start_time"] + max_dur
+
+    # 4. Face overlap relocation — move components away from speaker's face
+    face_windows = context.get("face_windows", [])
+    for comp in components:
+        bounds = comp.get("bounds", {})
+        bx, by, bw, bh = bounds.get("x", 0), bounds.get("y", 0), bounds.get("w", 0.2), bounds.get("h", 0.1)
+        for fw in face_windows:
+            # Check time overlap
+            if comp["start_time"] >= fw.get("end_time", 0) or fw.get("start_time", 0) >= comp["end_time"]:
+                continue
+            face_region = fw.get("face_region", {})
+            overlap = _rect_overlap_fraction(bounds, face_region)
+            if overlap > 0.05:
+                safe_regions = fw.get("safe_regions", [])
+                result = _find_best_safe_region(bw, bh, safe_regions)
+                if result:
+                    new_x, new_y, new_w, new_h = result
+                    bounds["x"] = round(new_x, 3)
+                    bounds["y"] = round(new_y, 3)
+                    bounds["w"] = round(new_w, 3)
+                    bounds["h"] = round(new_h, 3)
+                    issues.append(
+                        f"Relocated {comp.get('template', '?')} away from face at {comp['start_time']:.1f}s"
+                    )
+                break  # Only need to relocate once per component
+
+    # 5. Check max 2 concurrent (excluding edge-aligned templates like progress_bar)
+    edge_aligned_templates = {
+        name for name, spec in MG_TEMPLATE_REGISTRY.items()
+        if spec.spatial.edge_aligned
+    }
+    non_bar = [c for c in components if c["template"] not in edge_aligned_templates]
+    to_remove = set()
+    for i, a in enumerate(non_bar):
+        concurrent = []
+        for j, b in enumerate(non_bar):
+            if i == j:
+                continue
+            if a["start_time"] < b["end_time"] and b["start_time"] < a["end_time"]:
+                concurrent.append(j)
+        if len(concurrent) >= 2:
+            # Too many concurrent — drop lowest z_index among concurrent
+            candidates = sorted(concurrent, key=lambda j: non_bar[j].get("z_index", 0))
+            drop_idx = candidates[0]
+            if drop_idx not in to_remove:
+                to_remove.add(drop_idx)
+                issues.append(
+                    f"Dropped {non_bar[drop_idx]['template']} at {non_bar[drop_idx]['start_time']:.1f}s "
+                    f"(>2 concurrent)"
+                )
+
+    if to_remove:
+        dropped = {id(non_bar[i]) for i in to_remove}
+        components = [c for c in components if id(c) not in dropped]
+
+    # 6. Zoom viewport clamping (before spatial resolution so shifts get caught)
     zoom_effects = [
         e for e in context.get("opencv_effects", [])
         if e.get("effect_type") == "zoom"
@@ -742,7 +756,7 @@ def _validate_plan(
                     if bounds["y"] + bh > 1 - margin:
                         bounds["h"] = max(0.05, 1 - margin - bounds["y"] - 0.02)
 
-    # Zoom transition buffer — shift overlays away from zoom ease-in/ease-out
+    # 7. Zoom transition buffer — shift overlays away from zoom ease-in/ease-out
     for comp in components:
         for ze in zoom_effects:
             if comp["start_time"] >= ze.get("end_time", 0) or ze.get("start_time", 0) >= comp["end_time"]:
@@ -766,6 +780,14 @@ def _validate_plan(
                 comp["start_time"] = ze.get("end_time", 0) + 0.1
                 comp["end_time"] = comp["start_time"] + comp_dur
                 issues.append(f"Shifted {comp['template']} past zoom (transition window too short)")
+
+    # 8. Multi-pass spatial conflict resolution (max 3 iterations to converge)
+    for pass_num in range(3):
+        moved = _resolve_spatial_conflicts(components, edge_aligned_templates, issues)
+        if not moved:
+            break
+        if pass_num > 0:
+            issues.append(f"Re-resolved spatial conflicts (pass {pass_num + 1})")
 
     logger.info("Validation: %d components kept, %d issues", len(components), len(issues))
     return components, issues

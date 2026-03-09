@@ -15,7 +15,7 @@ interface Page {
  * Average character width is ~0.55 * fontSize for proportional fonts.
  */
 function estimateTextWidth(text: string, fontSize: number): number {
-  return text.length * fontSize * 0.55;
+  return text.length * fontSize * 0.6;
 }
 
 /**
@@ -85,7 +85,7 @@ export const Subtitles: React.FC<SubtitlesProps> = ({
   backgroundColor = "rgba(0, 0, 0, 0.6)",
 }) => {
   const frame = useCurrentFrame();
-  const { fps, width } = useVideoConfig();
+  const { fps, width, height } = useVideoConfig();
   const { left, top, scale, maxWidth } = useFaceAwareLayout(position, anchor);
   const style_ = useStyle();
   const scaledFontSize = fontSize * scale;
@@ -143,6 +143,8 @@ export const Subtitles: React.FC<SubtitlesProps> = ({
         left,
         top,
         maxWidth: Math.min(maxWidth, width * 0.85),
+        maxHeight: position.h * height,
+        overflow: "hidden",
         opacity,
         transform: `scale(${scaleIn})`,
         transformOrigin: "center center",
