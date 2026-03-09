@@ -520,8 +520,7 @@ def _rect_overlap_fraction(a: dict, b: dict) -> float:
     return (ox * oy) / a_area
 
 
-_FACE_PADDING = 0.15  # 15% normalized padding around face region
-
+_FACE_PADDING = 0.25
 # Safe frame used by free-rectangle tiling — 2% inset on all edges
 _SAFE_FRAME = {"x": 0.02, "y": 0.02, "w": 0.96, "h": 0.96}
 
