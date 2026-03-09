@@ -681,11 +681,12 @@ def _resolve_all_conflicts(
             if comp["start_time"] >= fw.get("end_time", 0) or fw.get("start_time", 0) >= comp["end_time"]:
                 continue
             fr = fw.get("face_region", {})
+            # Full-height column so components only land left/right of face
             obstacles.append({
                 "x": max(0, fr.get("x", 0) - _FACE_PADDING),
-                "y": max(0, fr.get("y", 0) - _FACE_PADDING),
+                "y": 0.0,
                 "w": fr.get("w", 0) + _FACE_PADDING * 2,
-                "h": fr.get("h", 0) + _FACE_PADDING * 2,
+                "h": 1.0,
             })
 
         for p in placed:
