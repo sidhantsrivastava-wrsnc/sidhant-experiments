@@ -605,7 +605,19 @@ def _rect_overlap_fraction(a: dict, b: dict) -> float:
     return (ox * oy) / a_area
 
 
-_FACE_PADDING = 0.25
+def _intersect_rects(a: dict, b: dict) -> dict | None:
+    """Return the intersection of two rects, or None if they don't overlap."""
+    x1 = max(a["x"], b["x"])
+    y1 = max(a["y"], b["y"])
+    x2 = min(a["x"] + a["w"], b["x"] + b["w"])
+    y2 = min(a["y"] + a["h"], b["y"] + b["h"])
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return {"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1}
+
+
+_FACE_PADDING = 0.05
+_COMPONENT_PADDING = 0.02  # gap between placed components
 # Safe frame used by free-rectangle tiling — 2% inset on all edges
 _SAFE_FRAME = {"x": 0.02, "y": 0.02, "w": 0.96, "h": 0.96}
 
@@ -705,26 +717,34 @@ def _find_best_free_placement(
             cy = r["y"] + r["h"] / 2
             return math.hypot(cx - ox, cy - oy)
         best = min(fitting, key=_dist)
-        px = round(best["x"] + (best["w"] - comp_w) / 2, 3)
-        py = round(best["y"] + (best["h"] - comp_h) / 2, 3)
+        px = round(max(best["x"], min(ox - comp_w / 2, best["x"] + best["w"] - comp_w)), 3)
+        py = round(max(best["y"], min(oy - comp_h / 2, best["y"] + best["h"] - comp_h)), 3)
         return px, py, round(comp_w, 3), round(comp_h, 3)
 
-    # No full-size fit — shrink into the largest free rect (preserve aspect ratio)
-    best = max(free_rects, key=lambda r: r["w"] * r["h"])
+    # No full-size fit — try every free rect and pick the one that preserves the
+    # most component area after aspect-ratio-aware fitting.  The old approach of
+    # "pick largest rect by area" ignored aspect ratio, causing aggressive
+    # shrinking when a better-shaped rect existed.
     if comp_w <= 0 or comp_h <= 0:
         return None
     aspect = comp_w / comp_h
-    new_w = min(comp_w, best["w"])
-    new_h = new_w / aspect
-    if new_h > best["h"]:
-        new_h = best["h"]
-        new_w = new_h * aspect
-    # Reject placement if shrinking would reduce area below 60% of original
-    if (new_w * new_h) < 0.6 * (comp_w * comp_h):
-        return None
-    px = round(best["x"] + (best["w"] - new_w) / 2, 3)
-    py = round(best["y"] + (best["h"] - new_h) / 2, 3)
-    return px, py, round(new_w, 3), round(new_h, 3)
+    best_placement = None
+    best_area = 0.0
+
+    for r in free_rects:
+        nw = min(comp_w, r["w"])
+        nh = nw / aspect
+        if nh > r["h"]:
+            nh = r["h"]
+            nw = nh * aspect
+        area = nw * nh
+        if area > best_area:
+            best_area = area
+            cx = round(max(r["x"], min(ox - nw / 2, r["x"] + r["w"] - nw)), 3)
+            cy = round(max(r["y"], min(oy - nh / 2, r["y"] + r["h"] - nh)), 3)
+            best_placement = (cx, cy, round(nw, 3), round(nh, 3))
+
+    return best_placement
 
 
 def _resolve_all_conflicts(
@@ -734,6 +754,7 @@ def _resolve_all_conflicts(
     issues: list[str],
     static_obstacles: list[dict] | None = None,
     safe_frame: dict | None = None,
+    zoom_effects: list[dict] | None = None,
 ) -> bool:
     """Single-pass free-rectangle tiling to resolve face and inter-component overlaps.
 
@@ -777,27 +798,52 @@ def _resolve_all_conflicts(
             if comp["start_time"] >= fw.get("end_time", 0) or fw.get("start_time", 0) >= comp["end_time"]:
                 continue
             fr = fw.get("face_region", {})
-            # Full-height column so components only land left/right of face
+            # Actual padded face rect (not full-height column)
             obstacles.append({
                 "x": max(0, fr.get("x", 0) - _FACE_PADDING),
-                "y": 0.0,
+                "y": max(0, fr.get("y", 0) - _FACE_PADDING),
                 "w": fr.get("w", 0) + _FACE_PADDING * 2,
-                "h": 1.0,
+                "h": fr.get("h", 0) + _FACE_PADDING * 2,
             })
 
         for p in placed:
             if comp["start_time"] >= p["end_time"] or p["start_time"] >= comp["end_time"]:
                 continue
-            obstacles.append({"x": p["x"], "y": p["y"], "w": p["w"], "h": p["h"]})
+            obstacles.append({
+                "x": max(0, p["x"] - _COMPONENT_PADDING),
+                "y": max(0, p["y"] - _COMPONENT_PADDING),
+                "w": p["w"] + _COMPONENT_PADDING * 2,
+                "h": p["h"] + _COMPONENT_PADDING * 2,
+            })
 
-        # Check if current bounds overlap any obstacle
+        # Compute per-component effective safe frame (zoom-aware)
+        comp_frame = dict(safe_frame or _SAFE_FRAME)
+        if zoom_effects:
+            for ze in zoom_effects:
+                if comp["start_time"] < ze.get("end_time", 0) and ze.get("start_time", 0) < comp["end_time"]:
+                    zp = ze.get("zoom_params")
+                    zoom_level = zp.get("zoom_level", 1.5) if zp else 1.5
+                    margin = (1.0 - 1.0 / zoom_level) / 2 + 0.02
+                    zoom_rect = {"x": margin, "y": margin, "w": 1.0 - 2 * margin, "h": 1.0 - 2 * margin}
+                    narrowed = _intersect_rects(comp_frame, zoom_rect)
+                    if narrowed:
+                        comp_frame = narrowed
+
+        # Check obstacle overlap OR out-of-effective-frame
+        bx_cur = bounds.get("x", 0)
+        by_cur = bounds.get("y", 0)
         has_conflict = any(_rect_overlap_fraction(bounds, obs) > 0 for obs in obstacles)
+        in_frame = (
+            bx_cur >= comp_frame["x"]
+            and by_cur >= comp_frame["y"]
+            and bx_cur + bw <= comp_frame["x"] + comp_frame["w"]
+            and by_cur + bh <= comp_frame["y"] + comp_frame["h"]
+        )
 
-        if has_conflict:
-            original_cx = bounds.get("x", 0) + bw / 2
-            original_cy = bounds.get("y", 0) + bh / 2
-            _frame = safe_frame or _SAFE_FRAME
-            free_rects = _compute_free_rects(_frame, obstacles)
+        if has_conflict or not in_frame:
+            original_cx = bx_cur + bw / 2
+            original_cy = by_cur + bh / 2
+            free_rects = _compute_free_rects(comp_frame, obstacles)
             result = _find_best_free_placement(bw, bh, free_rects, (original_cx, original_cy))
             if result:
                 new_x, new_y, new_w, new_h = result
@@ -806,7 +852,8 @@ def _resolve_all_conflicts(
                 bounds["w"] = new_w
                 bounds["h"] = new_h
                 changed = True
-                issues.append(f"Relocated {tpl} to free region (was conflicting)")
+                reason = "face/component conflict" if has_conflict else "outside zoom viewport"
+                issues.append(f"Relocated {tpl} to free region ({reason})")
             else:
                 issues.append(f"Could not relocate {tpl} — no free space available")
 
@@ -932,36 +979,11 @@ def _validate_plan(
         dropped = {id(non_bar[i]) for i in to_remove}
         components = [c for c in components if id(c) not in dropped]
 
-    # 5. Zoom viewport clamping (before spatial resolution so shifts get caught)
+    # 5. (Removed — zoom viewport constraints handled by zoom-aware tiling in step 7)
     zoom_effects = [
         e for e in context.get("opencv_effects", [])
         if e.get("effect_type") == "zoom"
     ]
-    for comp in components:
-        for ze in zoom_effects:
-            if comp["start_time"] < ze.get("end_time", 0) and ze.get("start_time", 0) < comp["end_time"]:
-                zoom_level = 1.5
-                zp = ze.get("zoom_params")
-                if zp:
-                    zoom_level = zp.get("zoom_level", 1.5)
-                inner = 1.0 / zoom_level  # fraction of frame visible
-                margin = (1.0 - inner) / 2
-                bounds = comp.get("bounds", {})
-                bx = bounds.get("x", 0)
-                by = bounds.get("y", 0)
-                bw = bounds.get("w", 0.2)
-                bh = bounds.get("h", 0.1)
-                if bx < margin or by < margin or (bx + bw) > (1 - margin) or (by + bh) > (1 - margin):
-                    issues.append(
-                        f"Adjusted {comp['template']} bounds during {zoom_level}x zoom "
-                        f"(viewport inner {inner:.0%})"
-                    )
-                    bounds["x"] = max(bounds.get("x", 0), margin + 0.02)
-                    bounds["y"] = max(bounds.get("y", 0), margin + 0.02)
-                    if bounds["x"] + bw > 1 - margin:
-                        bounds["w"] = max(0.1, 1 - margin - bounds["x"] - 0.02)
-                    if bounds["y"] + bh > 1 - margin:
-                        bounds["h"] = max(0.05, 1 - margin - bounds["y"] - 0.02)
 
     # 6. Zoom transition buffer — shift overlays away from zoom ease-in/ease-out
     for comp in components:
@@ -995,7 +1017,10 @@ def _validate_plan(
     tiling_safe_frame = dict(_SAFE_FRAME)
     if subtitle_region:
         tiling_safe_frame["h"] = subtitle_region["y"] - tiling_safe_frame["y"]
-    _resolve_all_conflicts(components, face_windows, edge_aligned_templates, issues, static_obstacles, tiling_safe_frame)
+    _resolve_all_conflicts(
+        components, face_windows, edge_aligned_templates, issues,
+        static_obstacles, tiling_safe_frame, zoom_effects,
+    )
 
     logger.info("Validation: %d components kept, %d issues", len(components), len(issues))
     return components, issues

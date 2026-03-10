@@ -9,7 +9,6 @@ class ParsedEffectCues(BaseModel):
     """Output schema for the LLM effect cue parser."""
 
     effects: list[EffectCue] = Field(
-        default_factory=list,
         description="List of detected effect cues from the transcript",
     )
     reasoning: str = Field(

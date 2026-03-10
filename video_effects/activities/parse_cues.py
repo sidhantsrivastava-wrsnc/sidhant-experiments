@@ -103,6 +103,7 @@ async def parse_effect_cues(input_data: dict) -> dict:
         system_prompt=system_prompt,
         user_message=user_message,
         response_model=ParsedEffectCues,
+        max_tokens=8192,
     )
 
     effects = result.get("effects", [])
