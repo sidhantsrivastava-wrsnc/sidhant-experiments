@@ -129,6 +129,8 @@ export const DynamicComposition: React.FC<CompositionPlan> = ({
                       position: "absolute",
                       inset: 0,
                       clipPath: `inset(${clipTop}% ${clipRight}% ${clipBottom}% ${clipLeft}%)`,
+                      zIndex: comp.zIndex,
+                      ...(comp.shadow ? { filter: `drop-shadow(${comp.shadow})` } : {}),
                     }}
                   >
                     <Component {...comp.props} position={comp.bounds} anchor={comp.anchor} />

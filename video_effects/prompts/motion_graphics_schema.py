@@ -23,7 +23,8 @@ class MGComponentSpec(BaseModel):
         default_factory=MGComponentBounds,
         description="Normalized screen region this component occupies",
     )
-    z_index: int = Field(0, description="Layering order (higher = on top)")
+    z_index: int = Field(0, description="Layering order. Tiers: 2=full-screen atmosphere, 5=border/frame, 10=infographic, 100=subtitle")
+    shadow: str = Field("", description="CSS drop-shadow value applied to the component container, e.g. '4px 4px 8px rgba(0,0,0,0.5)'")
     anchor: Literal["static", "face-right", "face-left", "face-below", "face-above", "face-beside"] = Field(
         "static",
         description="Positioning mode. 'static' uses bounds as-is. 'face-*' positions relative to speaker's face. 'face-beside' auto-picks left/right based on available space.",

@@ -18,6 +18,10 @@ from video_effects.schemas.mg_templates import (
     get_available_templates,
     load_guidance,
 )
+from video_effects.schemas.motion_graphics import (
+    Z_TIER_FULLSCREEN,
+    Z_TIER_INFOGRAPHIC,
+)
 from video_effects.schemas.styles import get_style
 
 logger = logging.getLogger(__name__)
@@ -565,7 +569,7 @@ def plan_motion_graphics(input_data: dict) -> dict:
         end_frame = round(comp["end_time"] * fps)
         duration_frames = max(1, end_frame - start_frame)
 
-        remotion_components.append({
+        entry: dict = {
             "template": comp["template"],
             "startFrame": start_frame,
             "durationInFrames": duration_frames,
@@ -573,7 +577,10 @@ def plan_motion_graphics(input_data: dict) -> dict:
             "bounds": comp.get("bounds", {"x": 0.1, "y": 0.1, "w": 0.3, "h": 0.1}),
             "zIndex": comp.get("z_index", 0),
             "anchor": comp.get("anchor", "static"),
-        })
+        }
+        if comp.get("shadow"):
+            entry["shadow"] = comp["shadow"]
+        remotion_components.append(entry)
 
     composition_plan = {
         "components": remotion_components,
@@ -787,6 +794,12 @@ def _resolve_all_conflicts(
             })
             continue
 
+        # Full-screen components (area > 0.8) — skip spatial conflict resolution entirely.
+        # These are atmospheric effects (color flash, text card, letterbox) that intentionally
+        # cover most/all of the screen and should not be relocated or blocked by face windows.
+        if bw * bh > 0.8:
+            continue
+
         # Build obstacles: padded face rects + already-placed component rects + static obstacles
         obstacles: list[dict] = []
 
@@ -902,6 +915,11 @@ def _validate_plan(
         bw = bounds.get("w", 0.2)
         bh = bounds.get("h", 0.1)
 
+        # Full-screen components (area > 0.8) skip bounds clamping — they intentionally
+        # cover the entire screen (e.g. color flash, text card, letterbox bars).
+        if bw * bh > 0.8:
+            continue
+
         # Ensure minimum dimensions
         bw = max(bw, 0.05)
         bh = max(bh, 0.03)
@@ -927,6 +945,14 @@ def _validate_plan(
         bounds["y"] = by
         bounds["w"] = bw
         bounds["h"] = bh
+
+    # 1b. Z-index tier enforcement — assign sensible defaults based on bounds area
+    for comp in components:
+        z = comp.get("z_index", 0)
+        if z == 0:
+            bounds = comp.get("bounds", {})
+            area = bounds.get("w", 0.2) * bounds.get("h", 0.1)
+            comp["z_index"] = Z_TIER_FULLSCREEN if area > 0.8 else Z_TIER_INFOGRAPHIC
 
     # 2. Clamp times to video duration
     for comp in components:

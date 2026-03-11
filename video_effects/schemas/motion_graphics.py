@@ -2,6 +2,12 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+# Z-index tier constants for consistent layer ordering
+Z_TIER_FULLSCREEN = 2       # Full-screen atmospheric effects (color flash, vignette pulse)
+Z_TIER_BORDER = 5           # Border/frame effects (animated border, corner brackets, edge glow)
+Z_TIER_INFOGRAPHIC = 10     # Standard infographic overlays (data viz, listicles, titles)
+Z_TIER_SUBTITLE = 100       # Subtitles (always on top)
+
 
 class NormalizedRect(BaseModel):
     """A rectangle in normalized [0-1] coordinates."""
@@ -37,6 +43,7 @@ class MotionGraphicsComponent(BaseModel):
     props: dict = Field(default_factory=dict)
     bounds: NormalizedRect = Field(default_factory=NormalizedRect)
     z_index: int = 0
+    shadow: str = ""
     reasoning: str = ""
 
 

@@ -23,6 +23,7 @@ export interface ComponentSpec {
   bounds: NormalizedRect;
   zIndex: number;
   anchor?: AnchorMode;
+  shadow?: string;
 }
 
 export interface FontWeights {

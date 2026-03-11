@@ -32,10 +32,30 @@ export const SPRING_SMOOTH = {
   stiffness: 100,
 } as const;
 
+export const SPRING_ELASTIC = {
+  damping: 5,
+  mass: 0.4,
+  stiffness: 300,
+} as const;
+
+export const SPRING_WOBBLY = {
+  damping: 8,
+  mass: 1.0,
+  stiffness: 150,
+} as const;
+
 export function snappySpring(frame: number, fps: number): number {
   return spring({ frame, fps, config: SPRING_SNAPPY });
 }
 
 export function smoothSpring(frame: number, fps: number): number {
   return spring({ frame, fps, config: SPRING_SMOOTH });
+}
+
+export function elasticSpring(frame: number, fps: number): number {
+  return spring({ frame, fps, config: SPRING_ELASTIC });
+}
+
+export function wobblySpring(frame: number, fps: number): number {
+  return spring({ frame, fps, config: SPRING_WOBBLY });
 }
