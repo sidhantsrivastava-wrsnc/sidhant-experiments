@@ -421,7 +421,7 @@ def _run_ffmpeg_with_progress(cmd, total_frames, fps):
 
 
 def _extract_passthrough(input_path, output_path, t_start, t_end, enc,
-                         reencode=False, is_hdr=False):
+                         reencode=False, is_hdr=False, src_codec=""):
     """Extract passthrough segment. Stream-copy when possible, re-encode when
     source codec differs from output codec or source is HDR."""
     if is_hdr:
@@ -429,8 +429,9 @@ def _extract_passthrough(input_path, output_path, t_start, t_end, enc,
     if reencode:
         cmd = [
             "ffmpeg", "-y", "-ss", str(t_start), "-to", str(t_end),
-            "-i", input_path,
         ]
+        cmd += _sw_decode_input(src_codec)
+        cmd += ["-i", input_path]
         if is_hdr:
             cmd += ["-vf", _HDR_TONEMAP_VF]
         cmd += ["-c:v", enc, "-an"]
@@ -455,7 +456,7 @@ def _extract_passthrough(input_path, output_path, t_start, t_end, enc,
 
 def _render_hold_ffmpeg(input_path, output_path, frame_start, frame_end,
                         face_data_stable, z, face_side, dest_x_full,
-                        fps, w, h, enc, is_hdr=False):
+                        fps, w, h, enc, is_hdr=False, src_codec=""):
     """
     Render a hold region (constant zoom, slowly drifting face) entirely via
     FFmpeg crop+scale — no Python frame loop.
@@ -536,6 +537,9 @@ def _render_hold_ffmpeg(input_path, output_path, frame_start, frame_end,
         vf = _HDR_TONEMAP_VF + "," + vf
     cmd = [
         "ffmpeg", "-y", "-ss", str(t_start), "-to", str(t_end),
+    ]
+    cmd += _sw_decode_input(src_codec)
+    cmd += [
         "-i", input_path, "-vf", vf, "-c:v", enc, "-pix_fmt", "yuv420p",
         "-an",
     ]
@@ -593,6 +597,51 @@ def _probe_source(video_path):
     if is_hdr:
         print(f"   HDR detected: transfer={transfer}, primaries={primaries}")
     return codec, is_hdr
+
+
+def _sw_decode_input(src_codec):
+    """Return FFmpeg input-side flags to force a software decoder for codecs
+    that the bundled OpenCV / default FFmpeg autoselection can't handle.
+
+    Must be placed BEFORE ``-i`` in the command.
+    """
+    if src_codec == "av1":
+        return ["-c:v", "libdav1d"]
+    return []
+
+
+def _probe_meta(video_path):
+    """Return (width, height, fps, n_frames) via ffprobe — works for any codec."""
+    r = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,r_frame_rate,nb_frames",
+            "-show_entries", "format=duration",
+            "-of", "csv=p=0",
+            video_path,
+        ],
+        capture_output=True, text=True,
+    )
+    lines = [l.strip() for l in r.stdout.strip().split("\n") if l.strip()]
+    # First line: stream info  (width,height,fps_fraction,nb_frames)
+    # Second line: format info  (duration)
+    stream_parts = lines[0].split(",") if lines else []
+    w = int(stream_parts[0]) if len(stream_parts) > 0 else 0
+    h = int(stream_parts[1]) if len(stream_parts) > 1 else 0
+    fps_str = stream_parts[2] if len(stream_parts) > 2 else "30"
+    if "/" in fps_str:
+        num, den = fps_str.split("/")
+        fps = float(num) / float(den)
+    else:
+        fps = float(fps_str)
+    nb_str = stream_parts[3] if len(stream_parts) > 3 else ""
+    if nb_str and nb_str != "N/A":
+        n_frames = int(nb_str)
+    else:
+        # Fallback: estimate from duration * fps
+        dur = float(lines[1]) if len(lines) > 1 and lines[1] != "N/A" else 0
+        n_frames = int(dur * fps) if dur > 0 else 0
+    return w, h, fps, n_frames
 
 
 def _probe_keyframe_times(video_path):
@@ -763,7 +812,8 @@ def _detect_range_worker(args):
     Worker function for parallel face detection.  Each worker opens its own
     ffmpeg pipe decoder and FaceLandmarker to process a batch of active ranges.
     """
-    video_path, ranges_batch, stride, worker_id = args
+    video_path, ranges_batch, stride, worker_id = args[:4]
+    src_codec = args[4] if len(args) > 4 else ""
     import subprocess as _sp
     import mediapipe as _mp
     from mediapipe.tasks.python import vision as _vision, BaseOptions as _BO
@@ -802,8 +852,11 @@ def _detect_range_worker(args):
     for rng_start, rng_end in ranges_batch:
         n_frames = rng_end - rng_start + 1
         t_start = rng_start / fps
-        cmd = [
-            "ffmpeg", "-ss", str(t_start), "-i", video_path,
+        cmd = ["ffmpeg", "-ss", str(t_start)]
+        if src_codec == "av1":
+            cmd += ["-c:v", "libdav1d"]
+        cmd += [
+            "-i", video_path,
             "-frames:v", str(n_frames),
             "-f", "rawvideo", "-pix_fmt", "rgb24",
             "pipe:1",
@@ -883,15 +936,13 @@ def _apply_worker_results(data, all_results, active_ranges, n_frames, default):
             data[fill_idx] = last_detected
 
 
-def get_face_data_seek(video_path, active_ranges, n_frames, stride=3):
+def get_face_data_seek(video_path, active_ranges, n_frames, stride=3,
+                       src_codec=""):
     """
     Seek-based face detection: only decode + detect frames within active_ranges.
     Runs inference every `stride` frames and interpolates the rest.
     """
-    cap = cv2.VideoCapture(video_path)
-    w, h = int(cap.get(3)), int(cap.get(4))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    cap.release()
+    w, h, fps, _ = _probe_meta(video_path)
 
     default = (w // 2, h // 2, 100, 100)
     data = [default] * n_frames
@@ -902,7 +953,7 @@ def get_face_data_seek(video_path, active_ranges, n_frames, stride=3):
 
     if n_workers <= 1:
         result, done_infer = _detect_range_worker(
-            (video_path, active_ranges, stride, 0)
+            (video_path, active_ranges, stride, 0, src_codec)
         )
         _apply_worker_results(data, [result], active_ranges, n_frames, default)
         print(f"   Inference: {done_infer} frames (stride={stride}, {total_read} read)")
@@ -928,7 +979,7 @@ def get_face_data_seek(video_path, active_ranges, n_frames, stride=3):
             batches[lightest].append(rng)
             batch_frames[lightest] += rng[1] - rng[0] + 1
         worker_args = [
-            (video_path, sorted(batch), stride, wi)
+            (video_path, sorted(batch), stride, wi, src_codec)
             for wi, batch in enumerate(batches) if batch
         ]
         print(f"   Parallel face detection: {len(worker_args)} workers, {len(split_ranges)} chunks from {len(active_ranges)} ranges")
@@ -1600,7 +1651,7 @@ class _ThreadedDecoder:
     """
 
     def __init__(self, input_path, frame_start, frame_end, w, h, fps,
-                 is_hdr=False):
+                 is_hdr=False, src_codec=""):
         self._queue = queue.Queue(maxsize=2)
         self._frame_size = w * h * 3
         self._shape = (h, w, 3)
@@ -1609,6 +1660,9 @@ class _ThreadedDecoder:
         cmd = [
             "ffmpeg",
             "-ss", str(t_start),
+        ]
+        cmd += _sw_decode_input(src_codec)
+        cmd += [
             "-i", input_path,
             "-frames:v", str(n_frames),
         ]
@@ -1654,6 +1708,7 @@ def _render_active_segment_fallback(
     blur_strength, blur_n_samples, whip_strength, whip_direction,
     times, overlay, overlay_config, face_side, dest_x_full,
     stabilize, debug_labels, fps, w, h, enc, is_hdr=False,
+    src_codec="",
 ):
     """Fallback GPU render using cv2.VideoCapture + ffmpeg pipe."""
     seg_p = p_curve[frame_start:frame_end + 1]
@@ -1672,7 +1727,7 @@ def _render_active_segment_fallback(
         _render_hold_ffmpeg(
             input_path, output_path, frame_start, frame_end,
             face_data_stable, hold_z, face_side, dest_x_full,
-            fps, w, h, enc, is_hdr=is_hdr,
+            fps, w, h, enc, is_hdr=is_hdr, src_codec=src_codec,
         )
         return
 
@@ -1708,7 +1763,7 @@ def _render_active_segment_fallback(
     buf_nv12_cpu = np.empty((h + h // 2, w), dtype=np.uint8)
 
     decoder = _ThreadedDecoder(input_path, frame_start, frame_end, w, h, fps,
-                               is_hdr=is_hdr)
+                               is_hdr=is_hdr, src_codec=src_codec)
     writer = open_ffmpeg_writer(output_path, w, h, fps, enc, pix_fmt="nv12")
 
     damp_fx = damp_fy = None
@@ -1832,6 +1887,7 @@ def _render_active_segment_gpu(
     blur_strength, blur_n_samples, whip_strength, whip_direction,
     times, overlay, overlay_config, face_side, dest_x_full,
     stabilize, debug_labels, fps, w, h, enc, is_hdr=False,
+    src_codec="",
 ):
     """GPU render: cv2 decode + GPU effects + ffmpeg h264_nvenc encode."""
     _render_active_segment_fallback(
@@ -1840,6 +1896,7 @@ def _render_active_segment_gpu(
         blur_strength, blur_n_samples, whip_strength, whip_direction,
         times, overlay, overlay_config, face_side, dest_x_full,
         stabilize, debug_labels, fps, w, h, enc, is_hdr=is_hdr,
+        src_codec=src_codec,
     )
 
 
@@ -1994,7 +2051,8 @@ def _run_segment_pipeline_gpu(
         def _extract(args):
             path, fs, fe = args
             _extract_passthrough(input_path, path, fs / fps, (fe + 1) / fps, enc,
-                                 reencode=need_reencode, is_hdr=is_hdr)
+                                 reencode=need_reencode, is_hdr=is_hdr,
+                                 src_codec=src_codec)
         with ThreadPoolExecutor(max_workers=min(len(pass_segs), 4)) as pool_ex:
             list(pool_ex.map(_extract, pass_segs))
         mode = "re-encoded" if need_reencode else "stream-copied"
@@ -2013,6 +2071,7 @@ def _run_segment_pipeline_gpu(
             blur_strength, blur_n_samples, whip_strength, whip_direction,
             times, overlay, overlay_config, face_side, dest_x_full,
             stabilize, debug_labels, fps, w, h, enc, is_hdr=is_hdr,
+            src_codec=src_codec,
         )
 
     elapsed_render = time.monotonic() - t1
@@ -2074,24 +2133,22 @@ def create_zoom_bounce_effect(
 
     print("GPU pipeline: CuPy + ffmpeg pipe decode + h264_nvenc")
 
+    src_codec, is_hdr = _probe_source(input_path)
+    probe_w, probe_h, probe_fps, probe_n = _probe_meta(input_path)
+    if src_codec == "av1":
+        print(f"   AV1 source detected — using libdav1d software decoder")
+
     print("1. Analyzing face trajectory ...")
     active_ranges = None
-    probe_cap = cv2.VideoCapture(input_path)
-    probe_fps = probe_cap.get(cv2.CAP_PROP_FPS)
-    probe_n = int(probe_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    probe_cap.release()
     active_ranges = _compute_active_frame_ranges(bounces, probe_fps, probe_n,
                                                    detect_holds=detect_holds)
     if active_ranges is not None:
         detect_frames = sum(e - s + 1 for s, e in active_ranges)
         print(f"   Selective detection: {detect_frames}/{probe_n} frames ({100*detect_frames/max(probe_n,1):.0f}%)")
-        raw_data, fps, (w, h) = get_face_data_seek(input_path, active_ranges, probe_n)
+        raw_data, fps, (w, h) = get_face_data_seek(
+            input_path, active_ranges, probe_n, src_codec=src_codec)
     else:
-        probe_cap = cv2.VideoCapture(input_path)
-        fps = probe_cap.get(cv2.CAP_PROP_FPS)
-        w, h = int(probe_cap.get(3)), int(probe_cap.get(4))
-        probe_n = int(probe_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        probe_cap.release()
+        w, h, fps = probe_w, probe_h, probe_fps
         default = (w // 2, h // 2, 100, 100)
         raw_data = [default] * probe_n
         print("   No face-dependent events — skipping detection")
@@ -2111,8 +2168,6 @@ def create_zoom_bounce_effect(
     if render_ranges is None:
         print("   No render ranges — nothing to do")
         return
-
-    src_codec, is_hdr = _probe_source(input_path)
 
     overlay = None
     if overlay_config:
