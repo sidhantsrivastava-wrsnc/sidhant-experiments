@@ -8,8 +8,8 @@ EFFECT_PHASES: dict[EffectType, int] = {
     EffectType.BLUR: 20,          # Phase 2: blur regions (before overlays)
     EffectType.WHIP: 25,          # Phase 2.5: whip transitions
     EffectType.ZOOM: 30,          # Phase 3: zoom/crop (geometric transform)
-    EffectType.SUBTITLE: 40,      # Phase 4: text overlays (on top of everything)
-    EffectType.SPEED_RAMP: 50,    # Phase 5: speed ramp (visual, runs last)
+    EffectType.SUBTITLE: 40,      # TODO: This should be removed. Subtitles are handled by the Remotion MG component.
+       EffectType.SPEED_RAMP: 50,    # Phase 5: speed ramp (visual, runs last)
 }
 
 

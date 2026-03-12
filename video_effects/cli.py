@@ -209,7 +209,7 @@ async def run_workflow(args) -> None:
                 elif choice in ("n", "no"):
                     feedback = input("Feedback (what to change): ").strip()
                     await handle.signal("approve_timeline", [False, feedback])
-                    print(f"Rejected with feedback. Retrying... (attempt {attempt + 2}/5)")
+                    print(f"Rejected with feedback. Retrying... (attempt {attempt + 2}/{NUMBER_OF_APPROVAL_ATTEMPTS})")
                     break
                 elif choice == "json":
                     print(json.dumps(prev_timeline, indent=2))
@@ -219,7 +219,7 @@ async def run_workflow(args) -> None:
             if approved:
                 break
         else:
-            print("Max retries reached.")
+            print(f"Max retries ({NUMBER_OF_APPROVAL_ATTEMPTS}) reached.")
             result = await handle.result()
             error = result.get("error") if isinstance(result, dict) else result.error
             if error:
@@ -230,7 +230,7 @@ async def run_workflow(args) -> None:
     print("\nWaiting for workflow completion...")
     result = await handle.result()
 
-    print(f"\nWorkflow completed!")
+    print("\nWorkflow completed successfully!")
     if isinstance(result, dict):
         print(f"  Output: {result.get('output_video', 'N/A')}")
         print(f"  Effects applied: {result.get('effects_applied', 'N/A')}")

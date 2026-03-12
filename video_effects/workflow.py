@@ -421,6 +421,7 @@ class VideoEffectsWorkflow:
                     )
 
         # ── Always inject subtitles from transcript ──
+        # TODO: This can be a separate function.
         if word_segments:
             fps = int(video_info.get("fps", 30))
 
@@ -471,6 +472,7 @@ class VideoEffectsWorkflow:
                 len(subtitle_words), first_frame, last_frame,
             )
 
+        #TODO: Soon there will be an approval step here. Basically it will be the "export" step after showing a preview of the motion graphics.
         # ── G8e + G9: Render overlay + composite (needs base video + approved plan) ──
         if mg_plan is not None and mg_plan.get("components"):
             mg_applied = await self._render_and_composite_mg(
