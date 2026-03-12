@@ -43,11 +43,6 @@ Analyze the transcript and extract every verbal cue that implies a video effect 
 - **preset**: match to the closest preset (warm, cool, bw, sepia, dramatic, custom)
 - **intensity**: 0.3 for subtle, 0.6 for normal, 1.0 for full
 
-### Subtitle
-- Triggered by: "put text", "add subtitle", "write on screen", "caption this", "title card"
-- Extract the exact text they want displayed
-- Default position: bottom
-
 ### Whip Transition
 - Triggered by: "whip", "swipe", "wipe transition", "swoosh", "fast cut"
 - **direction:** `"right"` default, `"left"` for flashbacks, `"up"` for energy, `"down"` for somber
@@ -72,12 +67,10 @@ Analyze the transcript and extract every verbal cue that implies a video effect 
 2. Set confidence based on how explicit the cue is: 1.0 for "zoom in now", 0.7 for implied effects.
 3. If multiple effects are triggered simultaneously, return all of them — conflict resolution happens later.
 4. Ignore casual mentions that aren't commands (e.g., "I was zooming around town" is NOT a zoom cue).
-5. For subtitle effects, extract the literal text the speaker wants displayed.
-6. Duration guidelines:
+5. Duration guidelines:
    - Zoom: 2-5 seconds
    - Blur: duration of the relevant section, or 3-5 seconds
    - Color change: until the next color cue or end of section (can be long)
-   - Subtitle: duration of the spoken text + 1 second
    - Whip: 0.3-0.8 seconds (always short)
    - Vignette: 5-30 seconds (sustained sections)
    - Speed ramp: 2-10 seconds

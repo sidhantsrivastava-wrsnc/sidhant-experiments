@@ -8,7 +8,6 @@ class EffectType(str, Enum):
     ZOOM = "zoom"
     BLUR = "blur"
     COLOR_CHANGE = "color_change"
-    SUBTITLE = "subtitle"
     WHIP = "whip"
     SPEED_RAMP = "speed_ramp"
     VIGNETTE = "vignette"
@@ -60,15 +59,6 @@ class ColorParams(BaseModel):
     b_adjust: float = 0.0
 
 
-class SubtitleParams(BaseModel):
-    text: str = ""
-    font_size: int = 48
-    color: str = "#FFFFFF"
-    background_color: Optional[str] = "#000000CC"
-    position: Literal["bottom", "top", "center"] = "bottom"
-    bold: bool = True
-
-
 class EffectCue(BaseModel):
     """A single effect cue parsed from transcript."""
     effect_type: EffectType
@@ -81,7 +71,6 @@ class EffectCue(BaseModel):
     zoom_params: Optional[ZoomParams] = None
     blur_params: Optional[BlurParams] = None
     color_params: Optional[ColorParams] = None
-    subtitle_params: Optional[SubtitleParams] = None
     whip_params: Optional[WhipParams] = None
     speed_ramp_params: Optional[SpeedRampParams] = None
     vignette_params: Optional[VignetteParams] = None

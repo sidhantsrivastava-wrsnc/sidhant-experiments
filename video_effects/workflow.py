@@ -9,8 +9,6 @@ with workflow.unsafe.imports_passed_through():
 
 MAX_RETRIES = 5
 
-# TODO: This should be calculated based on the video height and font size. Right now its based on the normalised values.
-# TODO: This should be moved to a constant
 SUBTITLE_BOUNDS = {"x": 0.0, "y": 0.78, "w": 1.0, "h": 0.22}
 
 
@@ -64,26 +62,12 @@ class VideoEffectsWorkflow:
         audio_path = audio_result.get("audio_path")
         original_audio_path = audio_result.get("original_audio_path")
 
-        # ── G2: Transcribe audio (+ optional jump cut detection in parallel) ──
-        transcribe_task = workflow.execute_activity(
+        # ── G2: Transcribe audio ──
+        transcript_result = await workflow.execute_activity(
             "vfx_transcribe_audio",
             {"audio_path": audio_path},
             start_to_close_timeout=activity_timeout,
         )
-
-        jump_cut_result = None
-        if input.smooth_jump_cuts:
-            jump_cut_task = workflow.execute_activity(
-                "vfx_detect_jump_cuts",
-                {"video_path": video_path, "video_info": video_info},
-                start_to_close_timeout=activity_timeout,
-                heartbeat_timeout=timedelta(minutes=5),
-            )
-            transcript_result, jump_cut_result = await asyncio.gather(
-                transcribe_task, jump_cut_task
-            )
-        else:
-            transcript_result = await transcribe_task
 
         # ── Creative Designer: auto-detect or apply style ──
         if input.style:
@@ -170,32 +154,6 @@ class VideoEffectsWorkflow:
             )
 
         effects = timeline.get("effects", [])
-
-        # Filter out subtitle effects — Remotion handles text overlays
-        effects = [e for e in effects if e.get("effect_type") != "subtitle"] # TODO: Just remove from upstream instead of here.
-
-        # TODO: Remove jump cuts  
-        if input.smooth_jump_cuts and jump_cut_result:
-            jump_cuts = jump_cut_result.get("jump_cuts", [])
-            for jc in jump_cuts:
-                effects.append({
-                    "effect_type": "zoom",
-                    "start_time": jc["time"] - 0.15,
-                    "end_time": jc["time"] + 0.35,
-                    "verbal_cue": "jump cut smoothing",
-                    "confidence": jc["confidence"],
-                    "zoom_params": {
-                        "tracking": "face",
-                        "zoom_level": 1.15,
-                        "easing": "smooth",
-                        "action": "bounce",
-                        "motion_blur": 0.3,
-                    },
-                })
-            if jump_cuts:
-                workflow.logger.info(
-                    "Injected %d synthetic zoom cues for jump cut smoothing", len(jump_cuts)
-                )
 
         # Inject color grading from style if applicable
         style_preset = get_style(style_preset_name)

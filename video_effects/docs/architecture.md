@@ -58,8 +58,6 @@ Three Temporal workflows coordinate the work:
         ┌──────────────────────────────────────────┐
         │           Post-approval setup            │
         │  • Inject color grading from style       │
-        │  • Inject jump-cut zoom smoothing        │
-        │  • Filter subtitles (Remotion handles)   │
         └────────┬───────────┬───────────┬─────────┘
                  │           │           │
     ┌────────────┤     ┌─────┴─────┐     │
@@ -147,7 +145,6 @@ Three Temporal workflows coordinate the work:
 | Motion graphics | `vfx_build_remotion_context`, `vfx_plan_motion_graphics`, `vfx_validate_merged_plan`, `vfx_load_composition_plan`, `vfx_render_motion_overlay`, `vfx_composite_motion_graphics`, `vfx_preview_motion_graphics` |
 | Infographics | `vfx_cleanup_generated`, `vfx_plan_infographics`, `vfx_plan_diagrams`, `vfx_plan_timelines`, `vfx_plan_quotes`, `vfx_plan_code_blocks`, `vfx_plan_comparisons`, `vfx_generate_infographic_code`, `vfx_validate_infographic`, `vfx_build_generated_registry` |
 | Creative | `vfx_design_style` |
-| Jump cuts | `vfx_detect_jump_cuts` |
 
 ### TypeScript Layer (Remotion)
 
@@ -194,7 +191,7 @@ Two streams run concurrently after approval:
 ## Key Design Decisions
 
 - **Single-pass frame processing**: No intermediate files between effects. Decode → apply all effects in phase order → encode.
-- **Phase ordering**: Effects execute in strict numeric order (vignette → color → blur → whip → zoom → subtitle → speed_ramp) to ensure correct composition.
+- **Phase ordering**: Effects execute in strict numeric order (vignette → color → blur → whip → zoom → speed_ramp) to ensure correct composition.
 - **Transparent overlays**: MG rendered as ProRes 4444 with alpha, composited via FFmpeg `premultiply + overlay`. Keeps the OpenCV and Remotion pipelines fully decoupled.
 - **LLM-driven planning**: Effects, motion graphics, and infographics are all planned by LLMs analyzing the transcript — not by explicit user markup.
 - **Human-in-the-loop**: One approval gate (timeline) with feedback loop, skippable via `--auto-approve`.

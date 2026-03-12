@@ -10,7 +10,6 @@ class VideoEffectsInput(BaseModel):
     enable_motion_graphics: bool = Field(False, description="Enable Remotion motion graphics overlay")
     style: str = Field("", description="Style preset name (empty = auto-detect via creative designer)")
     dev_mode: bool = Field(False, description="Dev mode: effects triggered by explicit verbal commands")
-    smooth_jump_cuts: bool = Field(False, description="Detect jump cuts and insert synthetic zoom transitions") # TODO: Find out what this is
     enable_infographics: bool = Field(False, description="Enable LLM-generated infographic overlays")
     enable_programmer: bool = Field(False, description="Enable free-hand creative programmer workflow")
 

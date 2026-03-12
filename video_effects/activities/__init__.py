@@ -14,7 +14,6 @@ from .remotion import (
     composite_motion_graphics,
     preview_motion_graphics,
 )
-from .detect_jump_cuts import detect_jump_cuts
 from .infographic import (
     cleanup_generated,
     plan_infographics,
@@ -52,7 +51,6 @@ ALL_VIDEO_EFFECTS_ACTIVITIES = [
     render_motion_overlay,
     composite_motion_graphics,
     preview_motion_graphics,
-    detect_jump_cuts,
     cleanup_generated,
     plan_infographics,
     plan_diagrams,

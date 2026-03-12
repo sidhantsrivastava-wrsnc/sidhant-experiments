@@ -184,10 +184,6 @@ Presets: `warm` (+10R, -5G, -15B), `cool` (-15R, +0G, +15B), `dramatic` (-10R, -
 
 Tracking modes: `face` (MediaPipe), `center`, `point`. Easing: `smooth` (cubic), `snap` (quick ramp), `overshoot`. Intensity ramps 0→100% over first 15% of duration, holds, then ramps down over last 15%. Uses `cv2.warpAffine` with `BORDER_REPLICATE`.
 
-#### SubtitleEffect (`effects/subtitle.py`) — Phase 40
-
-Renders text with `cv2.putText`. Supports configurable font size, hex color, background with alpha blending, and positioning (top/center/bottom).
-
 ## Frame Processing Pipeline (`activities/apply_effects.py`)
 
 ### Architecture
@@ -206,7 +202,7 @@ Renders text with `cv2.putText`. Supports configurable font size, hex color, bac
 ┌──────────────────────────────────────────────────────┐
 │  Per-Frame Loop (with active interval optimization)  │
 │                                                      │
-│  Color(10) → Blur(20) → Zoom(30) → Subtitle(40)     │
+│  Color(10) → Blur(20) → Zoom(30) → SpeedRamp(50)     │
 │                                                      │
 │  Inactive frames pass through untouched              │
 └──────────────┬───────────────────────────────────────┘
@@ -262,7 +258,7 @@ Before the frame loop, all effect cue time ranges are merged into a sorted list 
 
 ### Effect Models (`schemas/effects.py`)
 
-**`EffectType`** enum: `ZOOM`, `BLUR`, `COLOR_CHANGE`, `SUBTITLE`
+**`EffectType`** enum: `ZOOM`, `BLUR`, `COLOR_CHANGE`, `WHIP`, `SPEED_RAMP`, `VIGNETTE`
 
 **`EffectCue`**: `effect_type`, `start_time`, `end_time`, `verbal_cue`, `confidence ∈ [0, 1]`, plus optional type-specific params:
 
@@ -271,7 +267,9 @@ Before the frame loop, all effect cue time ranges are merged into a sorted list 
 | `ZoomParams` | `tracking` (face/center/point), `zoom_level` [0.1–3.0], `easing` (smooth/snap/overshoot) |
 | `BlurParams` | `blur_type` (gaussian/face_pixelate/background/radial), `radius`, `target_region` |
 | `ColorParams` | `preset` (warm/cool/bw/sepia/dramatic/custom), `intensity`, `r/g/b_adjust` |
-| `SubtitleParams` | `text`, `font_size`, `color`, `background_color`, `position`, `bold` |
+| `WhipParams` | `direction` (left/right/up/down), `intensity` [0.3–2.0] |
+| `SpeedRampParams` | `speed` [1.5–8.0], `easing` (smooth/snap) |
+| `VignetteParams` | `strength` [0.1–1.0], `radius` [0.3–1.0] |
 
 **`ValidatedTimeline`**: `effects: list[EffectCue]`, `conflicts_resolved: int`, `total_duration: float`
 
@@ -320,7 +318,6 @@ Before the frame loop, all effect cue time ranges are merged into a sorted list 
 | `effects/zoom.py` | `ZoomEffect` — face/center/point tracking with easing |
 | `effects/blur.py` | `BlurEffect` — gaussian, face pixelate, background, radial |
 | `effects/color.py` | `ColorEffect` — presets + custom RGB adjustments |
-| `effects/subtitle.py` | `SubtitleEffect` — text overlay with positioning |
 | `helpers/llm.py` | `call_structured()` — Anthropic tool-use wrapper |
 | `helpers/face_tracking.py` | `detect_faces()`, `smooth_data()` — MediaPipe wrapper |
 | `prompts/parse_effect_cues.md` | System prompt for LLM effect parsing |

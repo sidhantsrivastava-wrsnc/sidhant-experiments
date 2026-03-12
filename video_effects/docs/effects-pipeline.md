@@ -21,7 +21,6 @@ ffmpeg decode pipe (RGB24, with tone-mapping if HDR)
 │      Phase 20: Blur         │
 │      Phase 25: Whip         │
 │      Phase 30: Zoom         │
-│      Phase 40: Subtitle     │
 │      Phase 50: Speed Ramp   │
 │                             │
 └─────────────┬───────────────┘
@@ -50,7 +49,6 @@ Effects execute in strict numeric order. Gaps allow inserting new phases without
 | 20 | Blur | Region blur before geometric transforms |
 | 25 | Whip | Motion blur transition before zoom |
 | 30 | Zoom | Geometric crop/scale (face-tracked) |
-| 40 | Subtitle | Text on top of everything |
 | 50 | Speed Ramp | Visual speed effect runs last |
 
 The `group_by_phase()` function in `effect_registry.py` groups all active `EffectCue` objects by their phase number.
@@ -258,18 +256,3 @@ easing: Literal["smooth", "snap"] = "smooth"
 
 Visual-only effect (no time remapping). Smooth easing: `1.0 + (speed - 1) × sin(π·progress)`. Creates horizontal motion blur proportional to speed. Kernel size: `int(blur_amount × 30)`, alpha clamped to 0.6.
 
-### Subtitle
-
-**File:** `effects/subtitle.py`
-
-Parameters (`SubtitleParams`):
-```python
-text: str = ""
-font_size: int = 48
-color: str = "#FFFFFF"
-background_color: Optional[str] = "#000000CC"
-position: Literal["bottom", "top", "center"] = "bottom"
-bold: bool = True
-```
-
-Legacy burn-in using `cv2.FONT_HERSHEY_SIMPLEX`. When Remotion MG is enabled, subtitles are handled by the Remotion `Subtitles` component instead.

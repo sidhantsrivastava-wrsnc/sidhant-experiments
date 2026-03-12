@@ -3,7 +3,6 @@ from .effects import (
     ZoomParams,
     BlurParams,
     ColorParams,
-    SubtitleParams,
     TargetRegion,
     EffectCue,
     ValidatedTimeline,

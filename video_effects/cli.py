@@ -64,10 +64,6 @@ def _print_timeline(timeline: dict) -> None:
         elif etype == "color_change" and e.get("color_params"):
             cp = e["color_params"]
             detail = f" [{cp.get('preset', '?')}]"
-        elif etype == "subtitle" and e.get("subtitle_params"):
-            sp = e["subtitle_params"]
-            text = sp.get("text", "")
-            detail = f' ["{text}"]'
         elif etype == "whip" and e.get("whip_params"):
             wp = e["whip_params"]
             detail = f" [{wp.get('direction', '?')} {wp.get('intensity', '?')}x]"
@@ -172,7 +168,6 @@ async def run_workflow(args) -> None:
         enable_motion_graphics=enable_mg,
         style=args.style,
         dev_mode=args.dev,
-        smooth_jump_cuts=args.smooth_cuts,
         enable_infographics=enable_infographics,
         enable_programmer=enable_programmer,
     )
@@ -284,11 +279,6 @@ def main():
         "--dev",
         action="store_true",
         help="Dev mode: effects triggered by explicit verbal commands instead of inferred",
-    )
-    run_parser.add_argument(
-        "--smooth-cuts",
-        action="store_true",
-        help="Detect jump cuts and insert synthetic zoom transitions to smooth them",
     )
     run_parser.add_argument(
         "--infographics",

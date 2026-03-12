@@ -63,16 +63,6 @@ Use color grading shifts to mark tonal changes in the video.
 
 Note: If a style preset already applies color grading to the full video, DO NOT add redundant full-video color grades. Only add color changes for specific tonal shifts that differ from the base grade.
 
-### Subtitle
-Use on-screen text to reinforce key words, phrases, or numbers.
-
-**When to use:**
-- Speaker states an important number, statistic, or name → put it on screen
-- Key phrase or thesis statement → text reinforcement
-- Call to action ("subscribe", "check the link") → text overlay
-
-Extract the exact words/numbers to display. Keep text SHORT (1-6 words max).
-
 ### Whip Transition
 Use for dramatic section changes or topic transitions.
 
@@ -121,7 +111,7 @@ Creates a fast-forward visual effect for low-energy segments.
 2. **Match effect density to content.** A high-energy 30s clip might have 4-6 effects. A calm 2-minute podcast clip might have 2-3.
 3. **Timestamp precision matters.** Place effects at the exact moment of emphasis, not at the start of the sentence. If the key word is at 5.7s, start the zoom at 5.7s, not 5.0s.
 4. **Don't over-edit.** Not every sentence needs an effect. Look for genuine peaks, shifts, and moments — leave breathing room between effects.
-5. **Layer thoughtfully.** A zoom + subtitle at the same moment is great for emphasis. Three effects stacked on the same second is chaos.
+5. **Layer thoughtfully.** A zoom + color change at the same moment can work for emphasis. Three effects stacked on the same second is chaos.
 6. **Zoom is your primary tool.** In a typical talking-head video, 60-70% of effects should be zooms. They're the most natural and versatile enhancement.
 7. **Set confidence based on how clear the moment is.** Obvious emphasis → 1.0. Subtle tonal shift → 0.6-0.8.
 8. **Duration guidelines:**
@@ -129,7 +119,6 @@ Creates a fast-forward visual effect for low-energy segments.
    - Zoom in/out: 0.5-2s transition, unlimited hold
    - Blur: 3-5 seconds
    - Color change: duration of the tonal section (can be 10-30s)
-   - Subtitle: duration of the spoken text + 1 second
    - Whip: 0.3-0.8 seconds (always short)
    - Vignette: 5-30 seconds (sustained sections)
    - Speed ramp: 2-10 seconds

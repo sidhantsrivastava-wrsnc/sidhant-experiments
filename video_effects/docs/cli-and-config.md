@@ -16,7 +16,6 @@ python -m video_effects.cli run <input_video> [OPTIONS]
 | `--motion-graphics` | `--mg` | flag | False | Enable code-gen motion graphics overlays (routes through infographic pipeline) |
 | `--style` | `-s` | choice | auto-detect | Style preset name (see [Styles](styles.md)) |
 | `--dev` | — | flag | False | Dev mode: effects from explicit verbal commands |
-| `--smooth-cuts` | — | flag | False | Detect jump cuts and insert synthetic zoom transitions |
 | `--infographics` | — | flag | False | Enable LLM-generated infographic overlays (same as `--mg`) |
 
 ### Examples
@@ -168,7 +167,6 @@ auto_approve: bool
 enable_motion_graphics: bool
 style: str
 dev_mode: bool
-smooth_jump_cuts: bool
 enable_infographics: bool
 ```
 

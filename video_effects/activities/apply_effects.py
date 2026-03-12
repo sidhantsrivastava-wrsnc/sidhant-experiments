@@ -17,7 +17,7 @@ from temporalio import activity
 
 from video_effects.effect_registry import group_by_phase
 from video_effects.effects import (
-    ZoomEffect, BlurEffect, ColorEffect, SubtitleEffect,
+    ZoomEffect, BlurEffect, ColorEffect,
     WhipEffect, VignetteEffect, SpeedRampEffect,
 )
 from video_effects.effects.base import EffectContext
@@ -38,7 +38,6 @@ EFFECT_PROCESSORS = {
     EffectType.ZOOM: ZoomEffect,
     EffectType.BLUR: BlurEffect,
     EffectType.COLOR_CHANGE: ColorEffect,
-    EffectType.SUBTITLE: SubtitleEffect,
     EffectType.WHIP: WhipEffect,
     EffectType.SPEED_RAMP: SpeedRampEffect,
 }
